@@ -62,7 +62,14 @@ func NewTrinoConfigWithVersion(version string) (*TrinoConfig, error) {
 
 	port, _ := strconv.Atoi(resolveEnv("TRINO_PORT", "8080"))
 	ssl, _ := strconv.ParseBool(resolveEnv("TRINO_SSL", "true"))
-	sslInsecure, _ := strconv.ParseBool(resolveEnv("TRINO_SSL_INSECURE", "true"))
+	// TLS certificate verification is ON by default. TRINO_SSL_INSECURE=true
+	// disables server identity verification (development/self-signed only).
+	sslInsecureStr := resolveEnv("TRINO_SSL_INSECURE", "false")
+	sslInsecure, insecureErr := strconv.ParseBool(sslInsecureStr)
+	if insecureErr != nil {
+		log.Printf("WARNING: Invalid TRINO_SSL_INSECURE '%s': not a boolean. Using secure default (false).", sslInsecureStr)
+		sslInsecure = false
+	}
 	scheme := resolveEnv("TRINO_SCHEME", "https")
 	allowWriteQueries, _ := strconv.ParseBool(resolveEnv("TRINO_ALLOW_WRITE_QUERIES", "false"))
 
@@ -145,6 +152,14 @@ func NewTrinoConfigWithVersion(version string) (*TrinoConfig, error) {
 	// If using HTTPS, force SSL to true
 	if strings.EqualFold(scheme, "https") {
 		ssl = true
+	}
+
+	// Loud warning when certificate verification is disabled
+	if sslInsecure {
+		log.Println("WARNING: TLS certificate verification is DISABLED (TRINO_SSL_INSECURE=true). " +
+			"Connections are encrypted but the server's identity is NOT verified, leaving them " +
+			"vulnerable to man-in-the-middle attacks. Use only in development/test environments; " +
+			"for self-signed certificates, trust your internal CA instead.")
 	}
 
 	// Log a warning if write queries are allowed

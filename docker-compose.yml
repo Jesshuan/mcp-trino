@@ -30,6 +30,10 @@ services:
       - TRINO_CATALOG=memory
       - TRINO_SCHEMA=default
       - TRINO_SCHEME=http
+      # DEV-ONLY: local Trino ships no TLS certificate. This flag only takes
+      # effect when TRINO_SCHEME=https — if you switch this stack to https,
+      # certificate verification stays off. Never copy this into production.
+      - TRINO_SSL_INSECURE=true
       - MCP_TRANSPORT=http
       - MCP_PORT=8080
       - TRINO_ALLOWED_SCHEMAS=memory.analytics,memory.marts,memory.staging
