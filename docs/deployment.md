@@ -240,7 +240,8 @@ mcp-trino
 | TRINO_QUERY_TIMEOUT    | Query timeout in seconds          | 30        |
 | MCP_TRANSPORT          | Transport method (stdio/http)     | stdio     |
 | MCP_PORT               | HTTP port for http transport      | 8080      |
-| MCP_HOST               | Host for HTTP callbacks           | localhost |
+| MCP_HOST               | Listen address for HTTP transport (containers need 0.0.0.0) | 127.0.0.1 |
+| MCP_ALLOW_UNAUTHENTICATED_HTTP | Dev-only opt-in to run HTTP transport without OAuth. The server refuses to start otherwise | false |
 | MCP_URL                | Public base URL of MCP server (used for OAuth metadata and client discovery); required for remote deployments | http://localhost:8080 |
 | OAUTH_ENABLED    | Enable OAuth authentication | false |
 | OAUTH_PROVIDER         | OAuth provider (hmac/okta/google/azure) | hmac |

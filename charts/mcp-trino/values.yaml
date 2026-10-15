@@ -46,6 +46,10 @@ mcpServer:
   transport: "http"  # http or stdio
   port: 8080
   host: "0.0.0.0"
+  # DEV-ONLY opt-in: the server refuses to start an unauthenticated HTTP
+  # endpoint unless this is true. Enable OAuth (trino.oauth.enabled) instead
+  # for any real deployment.
+  allowUnauthenticatedHttp: false
 
 # Trino connection configuration
 trino:

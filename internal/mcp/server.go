@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -69,7 +70,25 @@ func (s *Server) ServeStdio() error {
 
 // ServeHTTP starts the MCP server with HTTP transport
 func (s *Server) ServeHTTP(port string) error {
-	addr := fmt.Sprintf(":%s", port)
+	// MCP_HOST is the actual listen address (default: loopback only).
+	// Containers must set MCP_HOST=0.0.0.0 explicitly to be reachable
+	// through the container network interface.
+	host := getEnv("MCP_HOST", "127.0.0.1")
+	addr := fmt.Sprintf("%s:%s", host, port)
+
+	// Refuse to start an unauthenticated network-facing server unless the
+	// operator explicitly opts in. Without this, a default HTTP deployment
+	// exposes the full query surface to anyone who can reach the port.
+	if !s.config.OAuthEnabled {
+		if optIn, _ := parseBoolEnv("MCP_ALLOW_UNAUTHENTICATED_HTTP"); !optIn {
+			return fmt.Errorf("refusing to start HTTP transport without authentication: " +
+				"enable OAuth (OAUTH_ENABLED=true) or explicitly acknowledge the risk with " +
+				"MCP_ALLOW_UNAUTHENTICATED_HTTP=true (development only)")
+		}
+		log.Println("WARNING: HTTP transport is running UNAUTHENTICATED " +
+			"(MCP_ALLOW_UNAUTHENTICATED_HTTP=true). Anyone who can reach this endpoint " +
+			"can execute queries with the configured Trino credentials.")
+	}
 
 	log.Println("Setting up StreamableHTTP server...")
 
@@ -169,14 +188,11 @@ func (s *Server) ServeHTTP(port string) error {
 // createMCPHandler creates the shared MCP handler function
 func (s *Server) createMCPHandler(streamableServer *mcpserver.StreamableHTTPServer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
+		// No CORS headers: this server serves MCP clients (Claude Code,
+		// agents, IDEs), not browsers. Emitting Access-Control-Allow-Origin
+		// would let any website read responses from a victim's browser
+		// (drive-by data exfiltration). Browser-based clients, if ever
+		// needed, require an explicit CORS allowlist (not yet implemented).
 
 		log.Printf("MCP %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
 
@@ -286,4 +302,17 @@ func getEnv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// parseBoolEnv reads a boolean environment variable (default: false)
+func parseBoolEnv(key string) (bool, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return false, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("invalid %s value '%s': must be a boolean", key, v)
+	}
+	return b, nil
 }
