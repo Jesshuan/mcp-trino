@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/trinodb/trino-go-client/trino"
@@ -81,7 +82,31 @@ type contextKey string
 
 const (
 	impersonatedUserKey contextKey = "impersonated_user"
+	basicCredentialsKey contextKey = "basic_credentials"
 )
+
+// basicCredentials holds per-user credentials extracted from an HTTP Basic
+// Authorization header (TRINO_AUTH_MODE=passthrough). They are used to open
+// a per-user Trino connection and must never be logged.
+type basicCredentials struct {
+	user     string
+	password string
+}
+
+// WithBasicCredentials attaches per-user credentials to the context
+// (TRINO_AUTH_MODE=passthrough)
+func WithBasicCredentials(ctx context.Context, user, password string) context.Context {
+	return context.WithValue(ctx, basicCredentialsKey, basicCredentials{user: user, password: password})
+}
+
+// GetBasicCredentials retrieves per-user credentials from the context
+func GetBasicCredentials(ctx context.Context) (user, password string, ok bool) {
+	creds, exists := ctx.Value(basicCredentialsKey).(basicCredentials)
+	if !exists || creds.user == "" {
+		return "", "", false
+	}
+	return creds.user, creds.password, true
+}
 
 // headerRoundTripper adds X-Trino-Source and X-Trino-User headers to requests
 type headerRoundTripper struct {
@@ -112,13 +137,32 @@ type Client struct {
 	db      *sql.DB
 	config  *config.TrinoConfig
 	timeout time.Duration
+
+	// Per-user connection cache for passthrough mode (TRINO_AUTH_MODE=passthrough)
+	userConns   map[string]*userConn
+	userConnsMu sync.Mutex
+	stopJanitor chan struct{}
 }
 
-// NewClient creates a new Trino client
-func NewClient(cfg *config.TrinoConfig) (*Client, error) {
+// userConn is a cached per-user connection pool
+type userConn struct {
+	db       *sql.DB
+	password string    // to detect credential rotation for the same username
+	lastUsed time.Time // guarded by Client.userConnsMu
+}
+
+// Limits for the per-user connection cache
+const (
+	maxUserConns        = 20               // max cached per-user pools (LRU eviction beyond this)
+	userConnIdleEvict   = 15 * time.Minute // evict pools unused for this long
+	userConnJanitorTick = 5 * time.Minute  // idle-sweep interval
+)
+
+// buildDSN constructs a Trino connection string for the given credentials
+func buildDSN(cfg *config.TrinoConfig, user, password string) string {
 	dsnURL := url.URL{
 		Scheme: cfg.Scheme,
-		User:   url.UserPassword(cfg.User, cfg.Password),
+		User:   url.UserPassword(user, password),
 		Host:   fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
 	}
 
@@ -130,7 +174,12 @@ func NewClient(cfg *config.TrinoConfig) (*Client, error) {
 	params.Add("custom_client", "mcp-trino")
 
 	dsnURL.RawQuery = params.Encode()
-	dsn := dsnURL.String()
+	return dsnURL.String()
+}
+
+// NewClient creates a new Trino client
+func NewClient(cfg *config.TrinoConfig) (*Client, error) {
+	dsn := buildDSN(cfg, cfg.User, cfg.Password)
 
 	httpClient := &http.Client{
 		Transport: &headerRoundTripper{
@@ -157,8 +206,12 @@ func NewClient(cfg *config.TrinoConfig) (*Client, error) {
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
 
-	// Test the connection
-	if err := db.Ping(); err != nil {
+	// Test the connection (service account). In passthrough mode without a
+	// service-account password, per-user connections carry authentication
+	// instead, so the anonymous startup ping is skipped.
+	if cfg.AuthMode == "passthrough" && cfg.Password == "" {
+		log.Println("INFO: Passthrough mode without service-account password: skipping startup connection test")
+	} else if err := db.Ping(); err != nil {
 		closeErr := db.Close()
 		if closeErr != nil {
 			log.Printf("Error closing DB connection: %v", closeErr)
@@ -168,16 +221,109 @@ func NewClient(cfg *config.TrinoConfig) (*Client, error) {
 		return nil, fmt.Errorf("failed to ping Trino: %w", sanitizedErr)
 	}
 
-	return &Client{
+	client := &Client{
 		db:      db,
 		config:  cfg,
 		timeout: cfg.QueryTimeout,
-	}, nil
+	}
+	if cfg.AuthMode == "passthrough" {
+		client.userConns = make(map[string]*userConn)
+		client.stopJanitor = make(chan struct{})
+		go client.janitor()
+	}
+	return client, nil
 }
 
-// Close closes the database connection
+// Close closes the database connection(s)
 func (c *Client) Close() error {
+	if c.stopJanitor != nil {
+		close(c.stopJanitor)
+	}
+	c.userConnsMu.Lock()
+	for _, uc := range c.userConns {
+		if err := uc.db.Close(); err != nil {
+			log.Printf("Error closing user connection: %v", err)
+		}
+	}
+	c.userConnsMu.Unlock()
 	return c.db.Close()
+}
+
+// dbForContext returns the connection pool to use for this request: the
+// shared service-account pool in standard mode, or a cached per-user pool
+// built from the request's Basic credentials in passthrough mode.
+func (c *Client) dbForContext(ctx context.Context) (*sql.DB, error) {
+	if c.config.AuthMode != "passthrough" {
+		return c.db, nil
+	}
+
+	user, password, ok := GetBasicCredentials(ctx)
+	if !ok {
+		return nil, fmt.Errorf("authentication required: passthrough mode requires HTTP Basic credentials")
+	}
+
+	c.userConnsMu.Lock()
+	defer c.userConnsMu.Unlock()
+
+	if uc, exists := c.userConns[user]; exists {
+		if uc.password == password {
+			uc.lastUsed = time.Now()
+			return uc.db, nil
+		}
+		// Credential changed for this username: drop the stale pool
+		_ = uc.db.Close()
+		delete(c.userConns, user)
+	}
+
+	// Enforce the cache cap by evicting the least recently used pool
+	if len(c.userConns) >= maxUserConns {
+		oldestKey := ""
+		var oldest time.Time
+		first := true
+		for k, uc := range c.userConns {
+			if first || uc.lastUsed.Before(oldest) {
+				oldestKey, oldest, first = k, uc.lastUsed, false
+			}
+		}
+		if oldestKey != "" {
+			_ = c.userConns[oldestKey].db.Close()
+			delete(c.userConns, oldestKey)
+		}
+	}
+
+	db, err := sql.Open("trino", buildDSN(c.config, user, password))
+	if err != nil {
+		// Sanitize error to prevent password exposure
+		return nil, fmt.Errorf("failed to open Trino connection: %w", sanitizeConnectionError(err, password))
+	}
+	// Per-user pools are smaller than the service-account pool
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
+	c.userConns[user] = &userConn{db: db, password: password, lastUsed: time.Now()}
+	return db, nil
+}
+
+// janitor periodically closes idle per-user connection pools
+func (c *Client) janitor() {
+	ticker := time.NewTicker(userConnJanitorTick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.stopJanitor:
+			return
+		case <-ticker.C:
+			c.userConnsMu.Lock()
+			for k, uc := range c.userConns {
+				if time.Since(uc.lastUsed) > userConnIdleEvict {
+					_ = uc.db.Close()
+					delete(c.userConns, k)
+				}
+			}
+			c.userConnsMu.Unlock()
+		}
+	}
 }
 
 // WithImpersonatedUser adds impersonated user to context
@@ -336,10 +482,21 @@ func (c *Client) ExecuteQueryWithContext(ctx context.Context, query string) (*Qu
 	queryCtx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
+	// Select the connection pool: shared service account, or per-user
+	// credentials from the request context (passthrough mode)
+	db, err := c.dbForContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	// Build query arguments for per-query user identity and attribution
 	// These are passed as NamedArgs to the Trino driver, which uses them to set
 	// session properties regardless of the authentication method.
 	_, userName := getOAuthUserAndUsername(ctx)
+	// In passthrough mode, attribute queries to the authenticated user
+	if user, _, ok := GetBasicCredentials(ctx); ok {
+		userName = user
+	}
 	queryArgs := []interface{}{
 		sql.Named("X-Trino-Client-Tags", userName),
 		sql.Named("X-Trino-Client-Info", userName),
@@ -359,7 +516,7 @@ func (c *Client) ExecuteQueryWithContext(ctx context.Context, query string) (*Qu
 	}
 
 	// Execute the query with optional attribution headers
-	rows, err := c.db.QueryContext(queryCtx, query, queryArgs...)
+	rows, err := db.QueryContext(queryCtx, query, queryArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("query execution failed: %w", err)
 	}

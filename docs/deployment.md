@@ -238,6 +238,7 @@ mcp-trino
 | TRINO_SSL_INSECURE     | Skip TLS certificate verification (dev/self-signed only — vulnerable to MITM) | false     |
 | TRINO_ALLOW_WRITE_QUERIES | Allow non-read-only SQL queries | false     |
 | TRINO_QUERY_TIMEOUT    | Query timeout in seconds          | 30        |
+| TRINO_AUTH_MODE        | Auth mode: `standard` (shared service account) or `passthrough` (per-user HTTP Basic credentials forwarded to Trino, e.g. LDAP; HTTP transport only; mutually exclusive with OAuth and impersonation) | standard |
 | MCP_TRANSPORT          | Transport method (stdio/http)     | stdio     |
 | MCP_PORT               | HTTP port for http transport      | 8080      |
 | MCP_HOST               | Listen address for HTTP transport (containers need 0.0.0.0) | 127.0.0.1 |

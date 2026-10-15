@@ -49,6 +49,11 @@ type TrinoConfig struct {
 
 	// Query attribution
 	TrinoSource string // Value for X-Trino-Source header (identifies query source to Trino)
+
+	// Authentication mode: "standard" (shared service account) or
+	// "passthrough" (per-user HTTP Basic credentials forwarded to Trino,
+	// e.g. LDAP; requires the HTTP transport)
+	AuthMode string
 }
 
 // NewTrinoConfig creates a new TrinoConfig with values from environment variables or defaults
@@ -215,6 +220,29 @@ func NewTrinoConfigWithVersion(version string) (*TrinoConfig, error) {
 	// Log query attribution configuration
 	log.Printf("INFO: Trino query source attribution: %s", trinoSource)
 
+	// Parse authentication mode: shared service account or per-user passthrough
+	authMode := strings.ToLower(resolveEnv("TRINO_AUTH_MODE", "standard"))
+	if authMode == "" {
+		authMode = "standard"
+	}
+	validAuthModes := map[string]bool{"standard": true, "passthrough": true}
+	if !validAuthModes[authMode] {
+		return nil, fmt.Errorf("invalid TRINO_AUTH_MODE '%s'. Supported modes: standard, passthrough", authMode)
+	}
+	if authMode == "passthrough" && oauthEnabled {
+		return nil, fmt.Errorf("TRINO_AUTH_MODE=passthrough and OAUTH_ENABLED=true are mutually exclusive: " +
+			"passthrough forwards client Basic credentials directly to Trino, OAuth validates tokens at the MCP layer")
+	}
+	if authMode == "passthrough" && enableImpersonation {
+		return nil, fmt.Errorf("TRINO_AUTH_MODE=passthrough and TRINO_ENABLE_IMPERSONATION=true are mutually exclusive: " +
+			"in passthrough mode queries already run as the authenticated user")
+	}
+	if authMode == "passthrough" {
+		log.Println("INFO: Per-user credential passthrough enabled (TRINO_AUTH_MODE=passthrough). " +
+			"Client HTTP Basic credentials are forwarded to Trino (e.g. LDAP) per request. " +
+			"Requires MCP_TRANSPORT=http; keep the endpoint behind TLS.")
+	}
+
 	return &TrinoConfig{
 		Host:                resolveEnv("TRINO_HOST", "localhost"),
 		Port:                port,
@@ -243,6 +271,7 @@ func NewTrinoConfigWithVersion(version string) (*TrinoConfig, error) {
 		EnableImpersonation: enableImpersonation,
 		ImpersonationField:  impersonationField,
 		TrinoSource:         trinoSource,
+		AuthMode:            authMode,
 	}, nil
 }
 

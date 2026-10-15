@@ -126,13 +126,18 @@ func runMCPServer() {
 		}
 	}()
 
-	// Test connection by listing catalogs
-	log.Println("Testing Trino connection...")
-	catalogs, err := trinoClient.ListCatalogsWithContext(context.Background())
-	if err != nil {
-		log.Fatalf("Failed to connect to Trino: %v", err)
+	// Test connection by listing catalogs. Skipped in passthrough mode without
+	// service-account credentials — per-user connections authenticate instead.
+	if trinoConfig.AuthMode != "passthrough" || trinoConfig.Password != "" {
+		log.Println("Testing Trino connection...")
+		catalogs, err := trinoClient.ListCatalogsWithContext(context.Background())
+		if err != nil {
+			log.Fatalf("Failed to connect to Trino: %v", err)
+		}
+		log.Printf("Connected to Trino server. Available catalogs: %s", strings.Join(catalogs, ", "))
+	} else {
+		log.Println("Skipping startup connection test (passthrough mode, no service-account password)")
 	}
-	log.Printf("Connected to Trino server. Available catalogs: %s", strings.Join(catalogs, ", "))
 
 	// Create MCP server
 	log.Println("Initializing MCP server...")
@@ -140,6 +145,12 @@ func runMCPServer() {
 
 	// Choose server mode
 	transport := getEnv("MCP_TRANSPORT", "stdio")
+
+	// Passthrough mode requires the HTTP transport: Basic credentials arrive
+	// as HTTP headers, which stdio cannot carry.
+	if trinoConfig.AuthMode == "passthrough" && transport != "http" {
+		log.Fatalf("TRINO_AUTH_MODE=passthrough requires MCP_TRANSPORT=http (Basic credentials are carried in HTTP headers)")
+	}
 
 	log.Printf("Starting MCP server with %s transport...", transport)
 	switch transport {

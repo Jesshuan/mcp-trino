@@ -79,10 +79,12 @@ func (s *Server) ServeHTTP(port string) error {
 	// Refuse to start an unauthenticated network-facing server unless the
 	// operator explicitly opts in. Without this, a default HTTP deployment
 	// exposes the full query surface to anyone who can reach the port.
-	if !s.config.OAuthEnabled {
+	// OAuth and credential passthrough both count as authentication.
+	if !s.config.OAuthEnabled && s.config.AuthMode != "passthrough" {
 		if optIn, _ := parseBoolEnv("MCP_ALLOW_UNAUTHENTICATED_HTTP"); !optIn {
 			return fmt.Errorf("refusing to start HTTP transport without authentication: " +
-				"enable OAuth (OAUTH_ENABLED=true) or explicitly acknowledge the risk with " +
+				"enable OAuth (OAUTH_ENABLED=true), use credential passthrough " +
+				"(TRINO_AUTH_MODE=passthrough), or explicitly acknowledge the risk with " +
 				"MCP_ALLOW_UNAUTHENTICATED_HTTP=true (development only)")
 		}
 		log.Println("WARNING: HTTP transport is running UNAUTHENTICATED " +
@@ -128,6 +130,14 @@ func (s *Server) ServeHTTP(port string) error {
 	go func() {
 		certFile := getEnv("HTTPS_CERT_FILE", "")
 		keyFile := getEnv("HTTPS_KEY_FILE", "")
+
+		// User passwords transit the server in passthrough mode: warn loudly
+		// when they would travel in cleartext (no local TLS, no mention of a
+		// TLS-terminating proxy in front).
+		if s.config.AuthMode == "passthrough" && certFile == "" && keyFile == "" {
+			log.Println("WARNING: Passthrough mode over plain HTTP: user passwords are transmitted in cleartext. " +
+				"Configure HTTPS_CERT_FILE/HTTPS_KEY_FILE or place a TLS-terminating proxy in front of this server.")
+		}
 
 		mcpHost := getEnv("MCP_HOST", "localhost")
 		mcpPort := getEnv("MCP_PORT", "8080")
@@ -223,6 +233,29 @@ func (s *Server) createMCPHandler(streamableServer *mcpserver.StreamableHTTPServ
 
 			contextFunc := oauth.CreateHTTPContextFunc()
 			ctx := contextFunc(r.Context(), r)
+			r = r.WithContext(ctx)
+		}
+
+		// Passthrough mode: extract HTTP Basic credentials and attach them to
+		// the request context. They are used to open a per-user Trino
+		// connection and are never logged.
+		if s.config.AuthMode == "passthrough" {
+			user, password, ok := r.BasicAuth()
+			if !ok {
+				log.Printf("Passthrough: no Basic credentials from %s, returning 401", r.RemoteAddr)
+				w.Header().Add("WWW-Authenticate", `Basic realm="trino", charset="UTF-8"`)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				errorResponse := map[string]string{
+					"error":             "invalid_credentials",
+					"error_description": "HTTP Basic authentication required (credentials are forwarded to Trino)",
+				}
+				if err := json.NewEncoder(w).Encode(errorResponse); err != nil {
+					log.Printf("Error encoding auth error response: %v", err)
+				}
+				return
+			}
+			ctx := trino.WithBasicCredentials(r.Context(), user, password)
 			r = r.WithContext(ctx)
 		}
 

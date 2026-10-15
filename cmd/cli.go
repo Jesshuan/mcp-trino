@@ -196,6 +196,9 @@ func runCLI(stdout, stderr io.Writer, rawArgs []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to load configuration: %w", err)
 	}
+	if trinoConfig.AuthMode == "passthrough" {
+		_, _ = fmt.Fprintln(stderr, "Warning: TRINO_AUTH_MODE=passthrough applies to the MCP HTTP server; CLI commands use the configured service-account credentials")
+	}
 
 	trinoClient, err := trino.NewClient(trinoConfig)
 	if err != nil {
