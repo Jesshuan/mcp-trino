@@ -68,28 +68,43 @@ func (s *Server) ServeStdio() error {
 	return mcpserver.ServeStdio(s.mcpServer)
 }
 
+// listenAddr returns the address the HTTP server binds to. MCP_HOST is the
+// actual listen address (default: loopback only). Containers must set
+// MCP_HOST=0.0.0.0 explicitly to be reachable through the container
+// network interface.
+func listenAddr(port string) string {
+	host := getEnv("MCP_HOST", "127.0.0.1")
+	return fmt.Sprintf("%s:%s", host, port)
+}
+
+// validateHTTPAuth enforces that a network-facing HTTP server runs with
+// authentication (OAuth or credential passthrough) unless the operator
+// explicitly opts in to running unauthenticated. Without this, a default
+// HTTP deployment exposes the full query surface to anyone who can reach
+// the port.
+func (s *Server) validateHTTPAuth() error {
+	if s.config.OAuthEnabled || s.config.AuthMode == "passthrough" {
+		return nil
+	}
+	optIn, _ := parseBoolEnv("MCP_ALLOW_UNAUTHENTICATED_HTTP")
+	if !optIn {
+		return fmt.Errorf("refusing to start HTTP transport without authentication: " +
+			"enable OAuth (OAUTH_ENABLED=true), use credential passthrough " +
+			"(TRINO_AUTH_MODE=passthrough), or explicitly acknowledge the risk with " +
+			"MCP_ALLOW_UNAUTHENTICATED_HTTP=true (development only)")
+	}
+	log.Println("WARNING: HTTP transport is running UNAUTHENTICATED " +
+		"(MCP_ALLOW_UNAUTHENTICATED_HTTP=true). Anyone who can reach this endpoint " +
+		"can execute queries with the configured Trino credentials.")
+	return nil
+}
+
 // ServeHTTP starts the MCP server with HTTP transport
 func (s *Server) ServeHTTP(port string) error {
-	// MCP_HOST is the actual listen address (default: loopback only).
-	// Containers must set MCP_HOST=0.0.0.0 explicitly to be reachable
-	// through the container network interface.
-	host := getEnv("MCP_HOST", "127.0.0.1")
-	addr := fmt.Sprintf("%s:%s", host, port)
+	addr := listenAddr(port)
 
-	// Refuse to start an unauthenticated network-facing server unless the
-	// operator explicitly opts in. Without this, a default HTTP deployment
-	// exposes the full query surface to anyone who can reach the port.
-	// OAuth and credential passthrough both count as authentication.
-	if !s.config.OAuthEnabled && s.config.AuthMode != "passthrough" {
-		if optIn, _ := parseBoolEnv("MCP_ALLOW_UNAUTHENTICATED_HTTP"); !optIn {
-			return fmt.Errorf("refusing to start HTTP transport without authentication: " +
-				"enable OAuth (OAUTH_ENABLED=true), use credential passthrough " +
-				"(TRINO_AUTH_MODE=passthrough), or explicitly acknowledge the risk with " +
-				"MCP_ALLOW_UNAUTHENTICATED_HTTP=true (development only)")
-		}
-		log.Println("WARNING: HTTP transport is running UNAUTHENTICATED " +
-			"(MCP_ALLOW_UNAUTHENTICATED_HTTP=true). Anyone who can reach this endpoint " +
-			"can execute queries with the configured Trino credentials.")
+	if err := s.validateHTTPAuth(); err != nil {
+		return err
 	}
 
 	log.Println("Setting up StreamableHTTP server...")
