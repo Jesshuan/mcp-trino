@@ -81,7 +81,7 @@ graph TB
 **Key Components:**
 
 - **AI Clients**: Various MCP-compatible applications
-- **Authentication**: Optional OAuth 2.0 with OIDC providers
+- **Authentication**: Optional OAuth 2.0 with OIDC providers, or per-user credential passthrough to Trino (LDAP)
 - **MCP Server**: Go-based server with dual transport support
 - **CLI Mode**: Interactive SQL shell for direct Trino access (psql-like)
 - **Data Layer**: Trino cluster connecting to multiple data sources
@@ -103,6 +103,7 @@ graph TB
   - **Production-ready**: Token caching, PKCE, defense-in-depth security
   - **Reusable**: OAuth library available for any Go MCP server
 - ✅ StreamableHTTP support with JWT authentication (upgraded from SSE)
+- ✅ Per-user credential passthrough for LDAP-backed Trino (`TRINO_AUTH_MODE=passthrough`): clients send HTTP Basic credentials, Trino authenticates the real user — per-user ACLs and audit without OAuth ([docs/passthrough.md](docs/passthrough.md))
 - ✅ Backward compatibility with SSE endpoints
 - ✅ Compatible with Cursor, Claude Desktop, Windsurf, ChatWise, and any MCP-compatible clients.
 - ✅ User Identity Tracking:
@@ -118,7 +119,7 @@ graph TB
 brew install tuannvm/mcp/mcp-trino
 
 # Or one-liner (macOS/Linux)
-curl -fsSL https://raw.githubusercontent.com/tuannvm/mcp-trino/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/tuannvm/mcp-trino/main/scripts/install-release.sh | bash
 ```
 
 **Run (Local Development):**
