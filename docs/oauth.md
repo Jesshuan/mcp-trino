@@ -141,6 +141,12 @@ sequenceDiagram
 
 ## OAuth Configuration Guide
 
+> **Mutually exclusive with passthrough mode**: `OAUTH_ENABLED=true` cannot be
+> combined with `TRINO_AUTH_MODE=passthrough` (the server refuses to start).
+> OAuth validates tokens at the MCP layer; passthrough forwards client Basic
+> credentials directly to Trino (e.g. LDAP). Pick one — see
+> [passthrough.md](passthrough.md) for the credential-forwarding model.
+
 ### Environment Variables
 
 | Variable | Native Mode | Proxy Mode | Purpose |

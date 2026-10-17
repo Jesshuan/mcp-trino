@@ -78,6 +78,23 @@ For remote MCP server with JWT authentication:
 }
 ```
 
+For remote MCP server with credential passthrough (Trino LDAP — the user's
+own credentials are forwarded to Trino, see
+[passthrough.md](passthrough.md)):
+
+```json
+{
+  "mcpServers": {
+    "mcp-trino-ldap": {
+      "url": "https://your-server-endpoint:8443/mcp",
+      "headers": {
+        "Authorization": "Basic <base64 of user:password>"
+      }
+    }
+  }
+}
+```
+
 For backward compatibility with SSE (legacy endpoint):
 
 ```json
@@ -98,6 +115,9 @@ MCP_TRANSPORT=http TRINO_HOST=<HOST> TRINO_PORT=<PORT> TRINO_USER=<USERNAME> TRI
 
 # With JWT authentication enabled
 MCP_TRANSPORT=http OAUTH_ENABLED=true TRINO_HOST=<HOST> TRINO_PORT=<PORT> TRINO_USER=<USERNAME> TRINO_PASSWORD=<PASSWORD> mcp-trino
+
+# With per-user credential passthrough (Trino LDAP — no service-account password needed)
+MCP_TRANSPORT=http TRINO_AUTH_MODE=passthrough TRINO_HOST=<HOST> TRINO_PORT=<PORT> TRINO_SCHEME=https mcp-trino
 
 # Production deployment with HTTPS
 MCP_TRANSPORT=http OAUTH_ENABLED=true HTTPS_CERT_FILE=/path/to/cert.pem HTTPS_KEY_FILE=/path/to/key.pem TRINO_HOST=<HOST> TRINO_PORT=<PORT> TRINO_USER=<USERNAME> TRINO_PASSWORD=<PASSWORD> mcp-trino

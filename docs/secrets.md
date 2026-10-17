@@ -4,6 +4,13 @@
 
 The recipes below cover the three environments that matter: local development, CI, and Kubernetes.
 
+> **Passthrough note**: with `TRINO_AUTH_MODE=passthrough` (see
+> [passthrough.md](passthrough.md)) there is no service-account
+> `TRINO_PASSWORD` to manage at all — each user's credentials arrive with
+> their requests. The recipes below apply to `standard` mode (shared
+> service account) and to OAuth secrets (`JWT_SECRET`,
+> `OIDC_CLIENT_SECRET`).
+
 ---
 
 ## TL;DR

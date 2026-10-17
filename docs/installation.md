@@ -5,8 +5,26 @@
 For macOS and Linux, install with a single command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tuannvm/mcp-trino/main/install.sh -o install.sh && chmod +x install.sh && ./install.sh
+curl -fsSL https://raw.githubusercontent.com/tuannvm/mcp-trino/main/scripts/install-release.sh -o install-release.sh && chmod +x install-release.sh && ./install-release.sh
 ```
+
+## Development Install (from source)
+
+To experiment with the CLI in dev mode, build from source with the repo's
+`install.sh` (requires Go 1.24+):
+
+```bash
+git clone https://github.com/tuannvm/mcp-trino.git
+cd mcp-trino
+./install.sh
+# Binary is built to ./bin/mcp-trino
+```
+
+Use `./install.sh --install-dir=~/.local/bin` to also copy it into your PATH.
+
+Note: the MCP server is client-agnostic. Registering it in a specific AI
+client (Claude Code, Claude Desktop) is a separate, optional step — see
+`scripts/configure-claude.sh`.
 
 ## Homebrew (macOS and Linux)
 
@@ -71,7 +89,9 @@ If you encounter issues during installation:
   chmod 755 ~/.local/bin
   ```
 
-- **Claude configuration not found**: If the install script doesn't detect your Claude installation:
+- **Claude configuration not found**: Client registration is handled by the
+  separate `scripts/configure-claude.sh` script (the MCP server itself is
+  client-agnostic):
   - For Claude Desktop: Check if the config file exists at the expected location
   - For Claude Code: Verify the `claude` command is available in PATH
   - Use the manual configuration instructions provided by the script
@@ -79,7 +99,7 @@ If you encounter issues during installation:
 - **GitHub API rate limiting**: If you're hitting GitHub API rate limits:
   ```bash
   export GITHUB_TOKEN=your_github_token
-  curl -fsSL https://raw.githubusercontent.com/tuannvm/mcp-trino/main/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/tuannvm/mcp-trino/main/scripts/install-release.sh | bash
   ```
 
 **Getting Help:**
