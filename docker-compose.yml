@@ -5,7 +5,7 @@ services:
     image: 'trinodb/trino:424'
     container_name: trino
     ports:
-      - '8080:8080'
+      - '8082:8080'
     volumes:
       - ./trino-conf:/etc/trino
     networks:
