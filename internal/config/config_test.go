@@ -355,3 +355,103 @@ func TestNewTrinoConfigReadsCredentialsFromEnv(t *testing.T) {
 		t.Fatalf("Password = %q, want env-pass", cfg.Password)
 	}
 }
+
+func TestNewTrinoConfigSSLInsecureDefault(t *testing.T) {
+	// Certificate verification must be ON by default; TRINO_SSL_INSECURE is
+	// an explicit, development-only opt-out.
+	original, hadEnv := os.LookupEnv("TRINO_SSL_INSECURE")
+	defer func() {
+		if hadEnv {
+			os.Setenv("TRINO_SSL_INSECURE", original)
+		} else {
+			os.Unsetenv("TRINO_SSL_INSECURE")
+		}
+	}()
+
+	t.Setenv("OAUTH_ENABLED", "false")
+
+	tests := []struct {
+		name  string
+		value string // env value; "unset" means remove the variable
+		want  bool
+	}{
+		{"unset defaults to verification on", "unset", false},
+		{"explicit true disables verification", "true", true},
+		{"explicit false keeps verification", "false", false},
+		{"invalid value falls back to secure default", "yes", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.value == "unset" {
+				os.Unsetenv("TRINO_SSL_INSECURE")
+			} else {
+				t.Setenv("TRINO_SSL_INSECURE", tt.value)
+			}
+
+			cfg, err := NewTrinoConfig()
+			if err != nil {
+				t.Fatalf("NewTrinoConfig() error = %v", err)
+			}
+			if cfg.SSLInsecure != tt.want {
+				t.Errorf("SSLInsecure = %v, want %v", cfg.SSLInsecure, tt.want)
+			}
+		})
+	}
+}
+
+func TestNewTrinoConfigAuthMode(t *testing.T) {
+	original, hadEnv := os.LookupEnv("TRINO_AUTH_MODE")
+	defer func() {
+		if hadEnv {
+			os.Setenv("TRINO_AUTH_MODE", original)
+		} else {
+			os.Unsetenv("TRINO_AUTH_MODE")
+		}
+	}()
+
+	t.Setenv("OAUTH_ENABLED", "false")
+	t.Setenv("TRINO_ENABLE_IMPERSONATION", "false")
+
+	tests := []struct {
+		name          string
+		authMode      string // env value; "unset" means remove the variable
+		oauthEnabled  string
+		impersonation string
+		wantMode      string
+		wantErr       bool
+	}{
+		{"unset defaults to standard", "unset", "false", "false", "standard", false},
+		{"explicit standard", "standard", "false", "false", "standard", false},
+		{"passthrough", "passthrough", "false", "false", "passthrough", false},
+		{"invalid mode rejected", "bogus", "false", "false", "", true},
+		{"passthrough with OAuth rejected", "passthrough", "true", "false", "", true},
+		{"passthrough with impersonation rejected", "passthrough", "false", "true", "", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.authMode == "unset" {
+				os.Unsetenv("TRINO_AUTH_MODE")
+			} else {
+				t.Setenv("TRINO_AUTH_MODE", tt.authMode)
+			}
+			t.Setenv("OAUTH_ENABLED", tt.oauthEnabled)
+			t.Setenv("TRINO_ENABLE_IMPERSONATION", tt.impersonation)
+
+			cfg, err := NewTrinoConfig()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("NewTrinoConfig() expected error, got nil (mode %q)", tt.authMode)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewTrinoConfig() error = %v", err)
+			}
+			if cfg.AuthMode != tt.wantMode {
+				t.Errorf("AuthMode = %q, want %q", cfg.AuthMode, tt.wantMode)
+			}
+		})
+	}
+}
