@@ -246,6 +246,9 @@ func (c *Client) Close() error {
 		}
 	}
 	c.userConnsMu.Unlock()
+	if c.db == nil {
+		return nil
+	}
 	return c.db.Close()
 }
 
@@ -264,6 +267,10 @@ func (c *Client) dbForContext(ctx context.Context) (*sql.DB, error) {
 
 	c.userConnsMu.Lock()
 	defer c.userConnsMu.Unlock()
+
+	if c.userConns == nil {
+		c.userConns = make(map[string]*userConn)
+	}
 
 	if uc, exists := c.userConns[user]; exists {
 		if uc.password == password {
