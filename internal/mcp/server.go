@@ -251,30 +251,50 @@ func (s *Server) createMCPHandler(streamableServer *mcpserver.StreamableHTTPServ
 			r = r.WithContext(ctx)
 		}
 
-		// Passthrough mode: extract HTTP Basic credentials and attach them to
-		// the request context. They are used to open a per-user Trino
-		// connection and are never logged.
+		// Passthrough mode: extract credentials from the Authorization header
+		// and attach them to the request context. Both HTTP Basic credentials
+		// and bearer tokens (JWT) are accepted and forwarded to Trino, which
+		// does the actual authentication. They are never logged.
 		if s.config.AuthMode == "passthrough" {
-			user, password, ok := r.BasicAuth()
-			if !ok {
-				log.Printf("Passthrough: no Basic credentials from %s, returning 401", r.RemoteAddr)
-				w.Header().Add("WWW-Authenticate", `Basic realm="trino", charset="UTF-8"`)
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusUnauthorized)
-				errorResponse := map[string]string{
-					"error":             "invalid_credentials",
-					"error_description": "HTTP Basic authentication required (credentials are forwarded to Trino)",
+			authHeader := r.Header.Get("Authorization")
+			switch {
+			case strings.HasPrefix(authHeader, "Bearer "):
+				token := strings.TrimPrefix(authHeader, "Bearer ")
+				if token == "" {
+					log.Printf("Passthrough: empty bearer token from %s, returning 401", r.RemoteAddr)
+					passthroughUnauthorized(w)
+					return
 				}
-				if err := json.NewEncoder(w).Encode(errorResponse); err != nil {
-					log.Printf("Error encoding auth error response: %v", err)
+				r = r.WithContext(trino.WithAccessToken(r.Context(), token))
+			default:
+				user, password, ok := r.BasicAuth()
+				if !ok {
+					log.Printf("Passthrough: no Basic or Bearer credentials from %s, returning 401", r.RemoteAddr)
+					passthroughUnauthorized(w)
+					return
 				}
-				return
+				r = r.WithContext(trino.WithBasicCredentials(r.Context(), user, password))
 			}
-			ctx := trino.WithBasicCredentials(r.Context(), user, password)
-			r = r.WithContext(ctx)
 		}
 
 		streamableServer.ServeHTTP(w, r)
+	}
+}
+
+// passthroughUnauthorized responds 401 challenging the client with both
+// accepted schemes: HTTP Basic credentials and bearer tokens (JWT). Both are
+// forwarded to Trino, which performs the actual authentication.
+func passthroughUnauthorized(w http.ResponseWriter) {
+	w.Header().Add("WWW-Authenticate", `Basic realm="trino", charset="UTF-8"`)
+	w.Header().Add("WWW-Authenticate", `Bearer realm="trino"`)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnauthorized)
+	errorResponse := map[string]string{
+		"error":             "invalid_credentials",
+		"error_description": "HTTP Basic or Bearer authentication required (credentials are forwarded to Trino)",
+	}
+	if err := json.NewEncoder(w).Encode(errorResponse); err != nil {
+		log.Printf("Error encoding auth error response: %v", err)
 	}
 }
 
@@ -317,7 +337,6 @@ func (s *Server) getOAuthStatusWithWarning() string {
 	}
 	return " (OAuth disabled)"
 }
-
 
 func trinoConfigToOAuthConfig(cfg *config.TrinoConfig) *oauth.Config {
 	serverURL := getEnv("MCP_URL", "")

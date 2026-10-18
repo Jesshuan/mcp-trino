@@ -239,7 +239,8 @@ func NewTrinoConfigWithVersion(version string) (*TrinoConfig, error) {
 	}
 	if authMode == "passthrough" {
 		log.Println("INFO: Per-user credential passthrough enabled (TRINO_AUTH_MODE=passthrough). " +
-			"Client HTTP Basic credentials are forwarded to Trino (e.g. LDAP) per request. " +
+			"Client HTTP Basic credentials or Bearer tokens (JWT) are forwarded to Trino per request " +
+			"(e.g. LDAP or JWT/OIDC authentication). " +
 			"Requires MCP_TRANSPORT=http; keep the endpoint behind TLS.")
 	}
 

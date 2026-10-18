@@ -69,6 +69,7 @@ func runCLI(stdout, stderr io.Writer, rawArgs []string) error {
 	port := flagSet.Int("port", 0, "Trino port (default: 8080)")
 	user := flagSet.String("user", "", "Trino user")
 	password := flagSet.String("password", "", "Trino password")
+	accessToken := flagSet.String("access-token", "", "Bearer token (JWT) forwarded to Trino (passthrough mode)")
 	catalog := flagSet.String("catalog", "", "Default catalog")
 	schema := flagSet.String("schema", "", "Default schema")
 	interactive := flagSet.Bool("interactive", false, "Start interactive REPL mode")
@@ -175,6 +176,7 @@ func runCLI(stdout, stderr io.Writer, rawArgs []string) error {
 	}
 	applyFlagToEnv("TRINO_USER", *user)
 	applyFlagToEnv("TRINO_PASSWORD", *password)
+	applyFlagToEnv("TRINO_ACCESS_TOKEN", *accessToken)
 	applyFlagToEnv("TRINO_CATALOG", *catalog)
 	applyFlagToEnv("TRINO_SCHEMA", *schema)
 
@@ -191,12 +193,15 @@ func runCLI(stdout, stderr io.Writer, rawArgs []string) error {
 	}
 	if os.Getenv("TRINO_USER") == "" {
 		// Passthrough mode has no shared service account: credentials are
-		// per-invocation, so prompt for them instead of failing
-		if trinoConfig.AuthMode == "passthrough" {
+		// per-invocation, so prompt for them instead of failing. A bearer
+		// token replaces Basic credentials entirely — the identity lives in
+		// the token, no user is needed.
+		hasToken := os.Getenv("TRINO_ACCESS_TOKEN") != ""
+		if trinoConfig.AuthMode == "passthrough" && !hasToken {
 			if err := promptPassthroughCredentials(stderr); err != nil {
 				return err
 			}
-		} else {
+		} else if trinoConfig.AuthMode != "passthrough" {
 			return fmt.Errorf("missing required configuration: user not set (provide via --user flag, profile, or TRINO_USER env var)")
 		}
 	}
@@ -235,10 +240,14 @@ func runCLI(stdout, stderr io.Writer, rawArgs []string) error {
 	defer cancel()
 
 	// Passthrough mode: this invocation's credentials are the query identity.
-	// The MCP server extracts HTTP Basic credentials from requests; the CLI
-	// supplies them from the flags/env/prompt used to run the command.
+	// The MCP server extracts HTTP Basic or Bearer credentials from requests;
+	// the CLI supplies them from the flags/env/prompt used to run the command.
 	if trinoConfig.AuthMode == "passthrough" {
-		ctx = trino.WithBasicCredentials(ctx, os.Getenv("TRINO_USER"), os.Getenv("TRINO_PASSWORD"))
+		if token := os.Getenv("TRINO_ACCESS_TOKEN"); token != "" {
+			ctx = trino.WithAccessToken(ctx, token)
+		} else {
+			ctx = trino.WithBasicCredentials(ctx, os.Getenv("TRINO_USER"), os.Getenv("TRINO_PASSWORD"))
+		}
 	}
 
 	// Handle interactive mode
@@ -393,6 +402,7 @@ FLAGS
     --port <port>       Trino port (default: 8080)
     --user <user>       Trino user (overrides profile and env)
     --password <pass>   Trino password
+    --access-token <jwt>  Bearer token forwarded to Trino (passthrough mode)
     --catalog <name>    Default catalog
     --schema <name>     Default schema
     --interactive       Start interactive REPL mode
@@ -425,11 +435,15 @@ EXAMPLES
     # Passthrough mode: prompt for per-invocation credentials
     TRINO_AUTH_MODE=passthrough mcp-trino --profile ldap-dev query 'SELECT 1'
 
+    # Passthrough mode with a bearer token (JWT) instead of user/password
+    TRINO_AUTH_MODE=passthrough mcp-trino --access-token "$TOKEN" query 'SELECT 1'
+
 ENVIRONMENT
     TRINO_HOST              Trino server hostname
     TRINO_PORT              Trino server port (default: 8080)
     TRINO_USER              Trino username (not required in passthrough mode)
     TRINO_PASSWORD          Trino password
+    TRINO_ACCESS_TOKEN      Bearer token (JWT) forwarded to Trino (passthrough mode)
     TRINO_CATALOG           Default catalog
     TRINO_SCHEMA            Default schema
     TRINO_SCHEME            Connection scheme: http or https (default: https)

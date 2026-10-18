@@ -3,6 +3,7 @@ package trino
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -260,5 +261,164 @@ func TestExecuteQueryWithContext_PassthroughRequiresCredentials(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "authentication required") {
 		t.Errorf("ExecuteQueryWithContext() error = %v, want 'authentication required'", err)
+	}
+}
+
+func TestWithAccessToken(t *testing.T) {
+	ctx := WithAccessToken(context.Background(), "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJhbGljZSJ0.sig")
+
+	token, ok := GetAccessToken(ctx)
+	if !ok {
+		t.Fatal("GetAccessToken() ok = false, want true")
+	}
+	if token != "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJhbGljZSJ0.sig" {
+		t.Errorf("token = %q, want the original token", token)
+	}
+}
+
+func TestGetAccessToken_NotSet(t *testing.T) {
+	if _, ok := GetAccessToken(context.Background()); ok {
+		t.Error("GetAccessToken() ok = true, want false on a bare context")
+	}
+	if _, ok := GetAccessToken(WithAccessToken(context.Background(), "")); ok {
+		t.Error("GetAccessToken() ok = true, want false for an empty token")
+	}
+}
+
+func TestBuildDSNToken(t *testing.T) {
+	cfg := &config.TrinoConfig{
+		Host:        "trino.example.com",
+		Port:        8443,
+		Catalog:     "memory",
+		Schema:      "default",
+		Scheme:      "https",
+		SSL:         true,
+		SSLInsecure: false,
+	}
+
+	dsn := buildDSNToken(cfg, "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.sig")
+
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("buildDSNToken() produced unparseable DSN %q: %v", dsn, err)
+	}
+	if u.User != nil {
+		t.Errorf("userinfo = %q, want none (identity must come from the token, not an X-Trino-User header)", u.User.String())
+	}
+	query := u.Query()
+	if got := query.Get("accessToken"); got != "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.sig" {
+		t.Errorf("accessToken param = %q, want the original token", got)
+	}
+	if got := query.Get("catalog"); got != "memory" {
+		t.Errorf("catalog param = %q, want memory", got)
+	}
+	if got := query.Get("custom_client"); got != "mcp-trino" {
+		t.Errorf("custom_client param = %q, want mcp-trino", got)
+	}
+}
+
+func TestJwtSubject(t *testing.T) {
+	encodePayload := func(t *testing.T, payload string) string {
+		t.Helper()
+		return "eyJhbGciOiJFUzI1NiJ9." +
+			base64.RawURLEncoding.EncodeToString([]byte(payload)) +
+			".c2ln"
+	}
+
+	tests := []struct {
+		name  string
+		token string
+		want  string
+	}{
+		{"valid token with sub claim", encodePayload(t, `{"sub":"alice","iss":"https://idp"}`), "alice"},
+		{"payload without sub claim", encodePayload(t, `{"iss":"https://idp"}`), ""},
+		{"malformed payload json", "aaa." + base64.RawURLEncoding.EncodeToString([]byte("not-json")) + ".ccc", ""},
+		{"payload is not base64", "aaa.###.ccc", ""},
+		{"not a jwt (no dots)", "garbage", ""},
+		{"empty token", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := jwtSubject(tt.token); got != tt.want {
+				t.Errorf("jwtSubject() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDbForContext_TokenPoolsCachedAndRotated(t *testing.T) {
+	ensureTestCustomClient(t)
+
+	c := &Client{config: passthroughTestConfig()}
+	defer func() { _ = c.Close() }()
+
+	alice := func(token string) context.Context {
+		return WithAccessToken(context.Background(), token)
+	}
+
+	// Same token twice: the pool must be cached, not re-opened
+	token1 := "aaa." + base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"alice"}`)) + ".sig1"
+	db1, err := c.dbForContext(alice(token1))
+	if err != nil {
+		t.Fatalf("dbForContext() error = %v", err)
+	}
+	db2, err := c.dbForContext(alice(token1))
+	if err != nil {
+		t.Fatalf("dbForContext() second call error = %v", err)
+	}
+	if db1 != db2 {
+		t.Error("dbForContext() re-opened the pool for the same token, want cached pool")
+	}
+
+	// Refreshed token, same subject: the stale pool must be replaced
+	token2 := "aaa." + base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"alice"}`)) + ".sig2"
+	db3, err := c.dbForContext(alice(token2))
+	if err != nil {
+		t.Fatalf("dbForContext() rotated token error = %v", err)
+	}
+	if db3 == db1 {
+		t.Error("dbForContext() reused the pool after token rotation, want a fresh pool")
+	}
+
+	// Different subject: separate pool
+	bobToken := "aaa." + base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"bob"}`)) + ".sig"
+	db4, err := c.dbForContext(alice(bobToken))
+	if err != nil {
+		t.Fatalf("dbForContext() second user error = %v", err)
+	}
+	if db4 == db3 {
+		t.Error("dbForContext() shared a pool between subjects, want per-subject pools")
+	}
+
+	c.userConnsMu.Lock()
+	if len(c.userConns) != 2 {
+		t.Errorf("user connection cache size = %d, want 2 (subject alice, subject bob)", len(c.userConns))
+	}
+	c.userConnsMu.Unlock()
+
+	// Token without a readable subject: keyed by hash, still works
+	opaque := "aaa." + base64.RawURLEncoding.EncodeToString([]byte(`{"iss":"https://idp"}`)) + ".sig"
+	if _, err := c.dbForContext(alice(opaque)); err != nil {
+		t.Fatalf("dbForContext() token without sub error = %v", err)
+	}
+}
+
+func TestDbForContext_TokenWithoutSubjectIsHashKeyed(t *testing.T) {
+	ensureTestCustomClient(t)
+
+	c := &Client{config: passthroughTestConfig()}
+	defer func() { _ = c.Close() }()
+
+	token := "aaa." + base64.RawURLEncoding.EncodeToString([]byte(`{"iss":"https://idp"}`)) + ".sig"
+	if _, err := c.dbForContext(WithAccessToken(context.Background(), token)); err != nil {
+		t.Fatalf("dbForContext() error = %v", err)
+	}
+
+	c.userConnsMu.Lock()
+	defer c.userConnsMu.Unlock()
+	wantKey := "jwt-hash:" + tokenHash(token)
+	if _, exists := c.userConns[wantKey]; !exists {
+		t.Errorf("pool key %q missing from cache, want hash-keyed pool for subject-less tokens", wantKey)
 	}
 }

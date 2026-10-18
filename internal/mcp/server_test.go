@@ -124,34 +124,50 @@ func TestMCPHandlerNoCORSHeaders(t *testing.T) {
 	}
 }
 
-func TestMCPHandlerPassthroughRequiresBasicCredentials(t *testing.T) {
+func TestMCPHandlerPassthroughRequiresCredentials(t *testing.T) {
 	s := &Server{config: &config.TrinoConfig{AuthMode: "passthrough"}}
 	handler := s.createMCPHandler(newTestStreamableServer())
 
-	t.Run("missing credentials returns 401 with Basic challenge", func(t *testing.T) {
+	t.Run("missing credentials returns 401 with Basic and Bearer challenges", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		handler(rec, httptest.NewRequest("POST", "/mcp", strings.NewReader(validInitializeBody)))
 
 		if rec.Code != http.StatusUnauthorized {
 			t.Errorf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
 		}
-		if got := rec.Header().Get("WWW-Authenticate"); !strings.Contains(got, `Basic realm="trino"`) {
-			t.Errorf("WWW-Authenticate = %q, want Basic realm=\"trino\" challenge", got)
+		challenges := rec.Header().Values("WWW-Authenticate")
+		if len(challenges) != 2 {
+			t.Errorf("WWW-Authenticate = %v, want both Basic and Bearer challenges", challenges)
 		}
 		if body := rec.Body.String(); !strings.Contains(body, "invalid_credentials") {
 			t.Errorf("body = %q, want error code invalid_credentials", body)
 		}
 	})
 
-	t.Run("bearer token is not accepted in passthrough mode", func(t *testing.T) {
+	t.Run("empty bearer token returns 401", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/mcp", strings.NewReader(validInitializeBody))
+		req.Header.Set("Authorization", "Bearer ")
+
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("status = %d, want %d (an empty bearer token authenticates nobody)", rec.Code, http.StatusUnauthorized)
+		}
+	})
+
+	t.Run("bearer token passes the auth gate", func(t *testing.T) {
 		req := httptest.NewRequest("POST", "/mcp", strings.NewReader(validInitializeBody))
 		req.Header.Set("Authorization", "Bearer some-token")
 
 		rec := httptest.NewRecorder()
 		handler(rec, req)
 
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("status = %d, want %d (only Basic credentials are forwarded to Trino)", rec.Code, http.StatusUnauthorized)
+		if rec.Code == http.StatusUnauthorized {
+			t.Error("status = 401, want the bearer token to reach the MCP server (Trino validates it)")
+		}
+		if got := rec.Header().Get("WWW-Authenticate"); got != "" {
+			t.Errorf("WWW-Authenticate = %q, want absent after successful auth", got)
 		}
 	})
 
