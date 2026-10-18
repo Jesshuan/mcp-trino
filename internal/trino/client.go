@@ -2,6 +2,7 @@ package trino
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"fmt"
 	"log"
@@ -177,13 +178,26 @@ func buildDSN(cfg *config.TrinoConfig, user, password string) string {
 	return dsnURL.String()
 }
 
+// newTransport builds the base HTTP transport. When TRINO_SSL_INSECURE=true,
+// TLS certificate verification is skipped. The trino-go-client has no
+// "SSLInsecure" DSN parameter (it only supports SSLCert/SSLCertPath), so the
+// skip must be applied on this custom client's transport — otherwise the flag
+// is silently ignored and self-signed certificates fail verification.
+func newTransport(cfg *config.TrinoConfig) http.RoundTripper {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if cfg.SSLInsecure {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // #nosec G402 -- opt-in via TRINO_SSL_INSECURE
+	}
+	return transport
+}
+
 // NewClient creates a new Trino client
 func NewClient(cfg *config.TrinoConfig) (*Client, error) {
 	dsn := buildDSN(cfg, cfg.User, cfg.Password)
 
 	httpClient := &http.Client{
 		Transport: &headerRoundTripper{
-			base:   http.DefaultTransport,
+			base:   newTransport(cfg),
 			config: cfg,
 		},
 	}
