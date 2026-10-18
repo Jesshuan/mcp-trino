@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -9,6 +10,8 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+
+	"golang.org/x/term"
 
 	"github.com/tuannvm/mcp-trino/internal/cli"
 	"github.com/tuannvm/mcp-trino/internal/config"
@@ -175,12 +178,27 @@ func runCLI(stdout, stderr io.Writer, rawArgs []string) error {
 	applyFlagToEnv("TRINO_CATALOG", *catalog)
 	applyFlagToEnv("TRINO_SCHEMA", *schema)
 
+	// Load Trino configuration first: the auth mode determines which
+	// credentials are required
+	trinoConfig, err := config.NewTrinoConfigWithVersion(Version)
+	if err != nil {
+		return fmt.Errorf("failed to load configuration: %w", err)
+	}
+
 	// Validate required fields
 	if os.Getenv("TRINO_HOST") == "" {
 		return fmt.Errorf("missing required configuration: host not set (provide via --host flag, profile, or TRINO_HOST env var)")
 	}
 	if os.Getenv("TRINO_USER") == "" {
-		return fmt.Errorf("missing required configuration: user not set (provide via --user flag, profile, or TRINO_USER env var)")
+		// Passthrough mode has no shared service account: credentials are
+		// per-invocation, so prompt for them instead of failing
+		if trinoConfig.AuthMode == "passthrough" {
+			if err := promptPassthroughCredentials(stderr); err != nil {
+				return err
+			}
+		} else {
+			return fmt.Errorf("missing required configuration: user not set (provide via --user flag, profile, or TRINO_USER env var)")
+		}
 	}
 
 	// Determine and validate output format
@@ -196,13 +214,8 @@ func runCLI(stdout, stderr io.Writer, rawArgs []string) error {
 		outputFormat = "table"
 	}
 
-	// Initialize Trino
-	trinoConfig, err := config.NewTrinoConfigWithVersion(Version)
-	if err != nil {
-		return fmt.Errorf("failed to load configuration: %w", err)
-	}
 	if trinoConfig.AuthMode == "passthrough" {
-		_, _ = fmt.Fprintln(stderr, "Warning: TRINO_AUTH_MODE=passthrough applies to the MCP HTTP server; CLI commands use the configured service-account credentials")
+		_, _ = fmt.Fprintln(stderr, "Passthrough mode: credentials from this invocation are forwarded to Trino")
 	}
 
 	trinoClient, err := trino.NewClient(trinoConfig)
@@ -220,6 +233,13 @@ func runCLI(stdout, stderr io.Writer, rawArgs []string) error {
 	// Set up context with signal handling
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	// Passthrough mode: this invocation's credentials are the query identity.
+	// The MCP server extracts HTTP Basic credentials from requests; the CLI
+	// supplies them from the flags/env/prompt used to run the command.
+	if trinoConfig.AuthMode == "passthrough" {
+		ctx = trino.WithBasicCredentials(ctx, os.Getenv("TRINO_USER"), os.Getenv("TRINO_PASSWORD"))
+	}
 
 	// Handle interactive mode
 	if *interactive || (len(args) > 0 && args[0] == "interactive") {
@@ -586,6 +606,43 @@ EXAMPLES
 		_, _ = fmt.Fprintf(w, "No help available for command: %s\n", command)
 		_, _ = fmt.Fprintf(w, "Run 'mcp-trino --help' for a list of commands.\n")
 	}
+}
+
+// promptPassthroughCredentials asks for per-invocation Trino credentials
+// (TRINO_AUTH_MODE=passthrough). The username is read normally and the
+// password without echo; only missing values are prompted. In passthrough
+// mode the CLI has no service account, so the credentials from this
+// invocation are forwarded to Trino as the query identity.
+func promptPassthroughCredentials(stderr io.Writer) error {
+	// Real terminal detection (not ModeCharDevice): /dev/null and pipes must
+	// not trigger an interactive prompt that would block forever
+	if !term.IsTerminal(int(syscall.Stdin)) {
+		return fmt.Errorf("TRINO_AUTH_MODE=passthrough requires per-invocation credentials: " +
+			"pass --user/--password or set TRINO_USER/TRINO_PASSWORD (no interactive terminal available)")
+	}
+
+	if os.Getenv("TRINO_USER") == "" {
+		_, _ = fmt.Fprint(stderr, "Trino user: ")
+		reader := bufio.NewReader(os.Stdin)
+		line, _ := reader.ReadString('\n')
+		user := strings.TrimSpace(line)
+		if user == "" {
+			return fmt.Errorf("no user provided")
+		}
+		_ = os.Setenv("TRINO_USER", user)
+	}
+
+	if os.Getenv("TRINO_PASSWORD") == "" {
+		_, _ = fmt.Fprint(stderr, "Trino password: ")
+		password, err := term.ReadPassword(int(syscall.Stdin))
+		if err != nil {
+			return fmt.Errorf("failed to read password: %w", err)
+		}
+		_, _ = fmt.Fprintln(stderr)
+		_ = os.Setenv("TRINO_PASSWORD", string(password))
+	}
+
+	return nil
 }
 
 // runConfigCommand handles config profile management commands

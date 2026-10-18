@@ -94,9 +94,12 @@ server):
   password, the cached pool is dropped and rebuilt.
 - **Query attribution**: `X-Trino-Client-Tags` / `X-Trino-Client-Info` carry
   the authenticated username, so Trino audit shows real users.
-- **CLI mode**: `TRINO_AUTH_MODE=passthrough` applies to the MCP HTTP server
-  only; CLI commands continue to use the configured service-account
-  credentials (env/profile).
+- **CLI mode**: each CLI invocation is its own identity — there is no shared
+  service account and `TRINO_USER` is not required. Credentials come from the
+  invocation itself: `--user`/`--password` flags, `TRINO_USER`/`TRINO_PASSWORD`
+  environment variables, or an interactive prompt (username plain, password
+  masked) when run from a terminal. Scripted (non-TTY) runs without
+  credentials fail with an explicit error.
 - **Startup guard**: passthrough counts as an authenticated deployment — no
   `MCP_ALLOW_UNAUTHENTICATED_HTTP` opt-in is needed.
 
