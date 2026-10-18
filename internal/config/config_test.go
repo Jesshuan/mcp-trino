@@ -3,9 +3,27 @@ package config
 import (
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
+
+// TestMain gives every test in the package a clean environment: variables
+// exported in the developer's shell (e.g. TRINO_AUTH_MODE=passthrough for CLI
+// testing) must not leak into test assertions. Each test sets exactly the
+// variables it needs and saves/restores them itself.
+func TestMain(m *testing.M) {
+	for _, kv := range os.Environ() {
+		key, _, _ := strings.Cut(kv, "=")
+		for _, prefix := range []string{"TRINO_", "MCP_", "OAUTH_", "OIDC_", "JWT_", "HTTPS_"} {
+			if strings.HasPrefix(key, prefix) {
+				_ = os.Unsetenv(key)
+				break
+			}
+		}
+	}
+	os.Exit(m.Run())
+}
 
 func TestParseAllowlist(t *testing.T) {
 	tests := []struct {
