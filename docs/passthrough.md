@@ -14,8 +14,8 @@ pick one authentication model per deployment.
 |---|---|---|---|
 | Trino sees | one service account | the real user | service account (or impersonated user) |
 | Trino ACLs | one shared blob | per-user | per-user (with impersonation) |
-| Client sends | nothing | user/password (Basic) | ephemeral token (Bearer) |
-| Trino auth backend | any | **password-based (LDAP)** | any |
+| Client sends | nothing | user/password (Basic) or Bearer token (JWT) | ephemeral token (Bearer) |
+| Trino auth backend | any | **password (LDAP)** or **Bearer-token auth (JWT, OAUTH2/OIDC)** | any |
 | Transport | stdio or http | **http only** | http |
 
 ## Architecture
@@ -27,18 +27,21 @@ Claude Code ──HTTPS + Basic auth──▶ mcp-trino ──per-user connectio
                                     Trino authenticates the REAL user ───────┘
 ```
 
-- The client sends `Authorization: Basic <base64(user:password)>` on every
-  MCP HTTP request.
+- The client sends `Authorization: Basic <base64(user:password)>` or
+  `Authorization: Bearer <jwt>` on every MCP HTTP request.
 - mcp-trino parses the header once, opens (and caches) a **per-user Trino
   connection pool** using those credentials, and never logs them.
-- Missing or malformed credentials get `401` with a
-  `WWW-Authenticate: Basic realm="trino"` challenge.
+- Missing or malformed credentials get `401` with both
+  `WWW-Authenticate: Basic` and `WWW-Authenticate: Bearer` challenges.
 - Trino rejects bad credentials at query time — mcp-trino adds no user
   database of its own.
 
-> **Token caveat**: an OAuth/IdP ephemeral token cannot be forwarded to an
-> LDAP-configured Trino — LDAP only validates passwords. If your users
-> authenticate with tokens, use [OAuth mode](oauth.md) instead.
+> **Token caveat**: which credentials passthrough can forward depends on how
+> Trino authenticates. `Authorization: Basic` reaches a **password-based
+> (LDAP)** Trino; `Authorization: Bearer` (JWT) reaches a Trino configured
+> with **JWT/OIDC authentication** — see [Bearer token passthrough](#bearer-token-passthrough-jwt)
+> below. mcp-trino validates nothing itself; if you want tokens *validated at
+> the MCP layer* before they reach Trino, use [OAuth mode](oauth.md) instead.
 
 ## Quick start
 
@@ -69,6 +72,77 @@ server):
   }
 }
 ```
+
+## Bearer token passthrough (JWT)
+
+Passthrough mode also accepts `Authorization: Bearer <jwt>` alongside Basic.
+This fits **AI agents and programmatic clients that obtain ephemeral tokens
+from an IdP at runtime** (OIDC/OAuth2 login, service-account token exchange):
+the token is set per request — or refreshed by the client lifecycle — and
+forwarded to Trino, so no long-lived Basic credentials are embedded in client
+configs.
+
+```json
+{
+  "mcpServers": {
+    "trino-oidc": {
+      "url": "https://your-server-endpoint:8443/mcp",
+      "headers": {
+        "Authorization": "Bearer <access-token>"
+      }
+    }
+  }
+}
+```
+
+**What mcp-trino does and does not do with the token:**
+
+- It **never validates the token** — no signature, expiry, issuer, or audience
+  checks. Trino's JWT/OIDC authenticator is the validator; mcp-trino is a
+  forwarding pipe. Rejected/expired tokens surface Trino's auth error.
+- It **never refreshes tokens** — the client owns the lifecycle. A refreshed
+  token simply arrives on the next request and the per-user connection pool is
+  rotated automatically.
+- It **derives the connection identity from the token**: the DSN carries only
+  the `accessToken` parameter (no user header), so Trino maps the token to
+  the user with whichever authenticator validates it (the token's `sub`
+  claim by default; see `principal-field` in the Trino authentication docs).
+  Connection pools are keyed by the token's **unverified** `sub` claim (used
+  for pool keying and query attribution only, never for authorization).
+
+**Trino side** must accept `Authorization: Bearer` tokens. In practice two
+authenticator setups do, and both work unchanged — mcp-trino only forwards
+the header and is agnostic to which one validates the token:
+
+- **JWT authenticator** — Trino validates the JWT itself against a JWKS:
+
+  ```properties
+  http-server.authentication.type=PASSWORD,JWT
+  http-server.authentication.jwt.key-file=https://your-idp/.well-known/jwks.json
+  ```
+
+- **OAUTH2 authenticator** (OIDC) — Trino delegates validation to the OIDC
+  provider; access tokens issued by that provider are accepted when presented
+  directly, the same way the official Trino CLI's `--access-token` flag works:
+
+  ```properties
+  http-server.authentication.type=PASSWORD,OAUTH2
+  http-server.authentication.oauth2.issuer=https://your-idp
+  http-server.authentication.oauth2.client-id=...
+  http-server.authentication.oauth2.client-secret=...
+  ```
+
+**CLI testing** uses the same plumbing — `--access-token` or
+`TRINO_ACCESS_TOKEN` replaces user/password entirely (no prompt, no
+`TRINO_USER` needed):
+
+```bash
+TRINO_AUTH_MODE=passthrough TRINO_ACCESS_TOKEN=eyJ... mcp-trino query 'SELECT 1'
+TRINO_AUTH_MODE=passthrough mcp-trino --access-token "$TOKEN" query 'SELECT 1'
+```
+
+Tokens are still secrets: prefer the environment variable or a secrets CLI
+over `--access-token` to keep them out of shell history.
 
 ## Testing with the CLI
 
@@ -123,9 +197,10 @@ account.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `TRINO_AUTH_MODE` | `standard` | `standard` = shared service account; `passthrough` = per-user Basic credentials |
+| `TRINO_AUTH_MODE` | `standard` | `standard` = shared service account; `passthrough` = per-user Basic or Bearer credentials |
 | `MCP_TRANSPORT` | `stdio` | Must be `http` for passthrough |
 | `TRINO_USER`/`TRINO_PASSWORD` | — | Optional in passthrough mode: used only for the startup connection test (and CLI commands) |
+| `TRINO_ACCESS_TOKEN` | — | CLI only: bearer token (JWT) replacing user/password; on the server side tokens arrive per request in the `Authorization` header |
 | `HTTPS_CERT_FILE` / `HTTPS_KEY_FILE` | — | Provide TLS, or put a TLS-terminating proxy in front; the server warns loudly otherwise |
 
 **Mutually exclusive** (the server refuses to start):
@@ -135,12 +210,13 @@ account.
 
 ## Behavior details
 
-- **Per-user connection cache**: pools are keyed by username (max 20, LRU
-  eviction, 15-minute idle expiry, 5-minute connection lifetime). Rapid tool
-  calls from the same user reuse one pool instead of re-binding to LDAP each
-  time.
+- **Per-user connection cache**: Basic pools are keyed by username, bearer
+  pools by the token's unverified `sub` claim (max 20, LRU eviction,
+  15-minute idle expiry, 5-minute connection lifetime). Rapid tool calls from
+  the same user reuse one pool instead of re-binding each time.
 - **Credential rotation**: if the same username presents a different
-  password, the cached pool is dropped and rebuilt.
+  password, or the same subject presents a different (refreshed) token, the
+  cached pool is dropped and rebuilt.
 - **Query attribution**: `X-Trino-Client-Tags` / `X-Trino-Client-Info` carry
   the authenticated username, so Trino audit shows real users.
 - **CLI mode**: each CLI invocation is its own identity — there is no shared
@@ -158,6 +234,10 @@ account.
   request. Terminate TLS at mcp-trino (`HTTPS_CERT_FILE`/`HTTPS_KEY_FILE`) or
   at a proxy in front (e.g. `https://your-endpoint:8443` → `mcp-trino:8080`).
   The server logs a loud warning when running passthrough over plain HTTP.
+- **Bearer tokens are forwarded, not validated.** Anyone who can reach the
+  MCP endpoint can present *any* token; only Trino decides whether it is
+  acceptable. Put network-level access control in front of mcp-trino and keep
+  Trino's JWT authenticator strict (issuer, audience, signature).
 - **Never put credentials in tool arguments or URLs** — they must travel only
   in the `Authorization` header. Tool arguments can end up in LLM transcripts.
 - **Treat the server as a credential-handling system**: it holds user

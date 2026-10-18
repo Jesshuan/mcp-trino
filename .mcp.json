@@ -4,7 +4,7 @@
       "type": "http",
       "url": "http://localhost:8081/mcp",
       "headers": {
-        "Authorization": "Basic WRONGfALSEPAssworDExample"
+        "Authorization": "Basic YWRtaW46c2VjcmV0"
       }
     }
   }

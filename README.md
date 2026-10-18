@@ -103,7 +103,7 @@ graph TB
   - **Production-ready**: Token caching, PKCE, defense-in-depth security
   - **Reusable**: OAuth library available for any Go MCP server
 - ✅ StreamableHTTP support with JWT authentication (upgraded from SSE)
-- ✅ Per-user credential passthrough for LDAP-backed Trino (`TRINO_AUTH_MODE=passthrough`): clients send HTTP Basic credentials, Trino authenticates the real user — per-user ACLs and audit without OAuth ([docs/passthrough.md](docs/passthrough.md))
+- ✅ Per-user credential passthrough for LDAP- or JWT-backed Trino (`TRINO_AUTH_MODE=passthrough`): clients send HTTP Basic credentials or `Authorization: Bearer` tokens (JWT), Trino authenticates the real user — per-user ACLs and audit without OAuth ([docs/passthrough.md](docs/passthrough.md))
 - ✅ Backward compatibility with SSE endpoints
 - ✅ Compatible with Cursor, Claude Desktop, Windsurf, ChatWise, and any MCP-compatible clients.
 - ✅ User Identity Tracking:
@@ -171,6 +171,9 @@ TRINO_AUTH_MODE=passthrough mcp-trino --profile dev-passthrough query 'SELECT 1'
 
 # Explicit credentials (scripted / CI)
 TRINO_AUTH_MODE=passthrough mcp-trino --user alice --password '...' query 'SELECT 1'
+
+# Bearer token (JWT) instead of user/password — forwarded to Trino
+TRINO_AUTH_MODE=passthrough mcp-trino --access-token "$TOKEN" query 'SELECT 1'
 
 # Interactive REPL: credentials asked once, then every query runs as that identity
 TRINO_AUTH_MODE=passthrough mcp-trino --profile dev-passthrough interactive
@@ -324,7 +327,8 @@ export TRINO_SCHEME=https          # http or https (default: https)
 export TRINO_SSL=true
 export TRINO_MAX_ROWS=10000        # rows per query (default: 10000)
 export TRINO_QUERY_TIMEOUT=300     # seconds (default: 300)
-# TRINO_AUTH_MODE=passthrough      # per-user credentials; CLI prompts per invocation
+# export TRINO_AUTH_MODE=passthrough      # per-user credentials; CLI prompts per invocation
+# export TRINO_ACCESS_TOKEN=eyJ...        # passthrough via Bearer token (JWT) instead of user/password
 ```
 
 **Secret Management** (recommended):

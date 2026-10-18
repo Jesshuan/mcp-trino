@@ -204,11 +204,14 @@ docker run -d -p 8080:8080 \
 - **Credential Passthrough** (see [passthrough.md](passthrough.md)):
   - User passwords transit the server on every request — TLS is mandatory
     (terminate at the server or at a proxy in front)
-  - Credentials travel only in the `Authorization: Basic` header, never in
-    tool arguments (which can end up in LLM transcripts) or URLs
+  - Credentials travel only in the `Authorization: Basic`/`Authorization: Bearer`
+    header, never in tool arguments (which can end up in LLM transcripts) or URLs
+  - Bearer tokens are forwarded to Trino **without validation** — Trino's
+    JWT/OIDC authenticator is the only validator; protect the MCP endpoint at
+    the network level accordingly
   - Keep Trino TLS verification enabled (`TRINO_SSL_INSECURE=false`)
-  - The server holds user passwords in memory for the connection cache
-    lifetime — treat it as a credential-handling system
+  - The server holds user passwords and tokens in memory for the connection
+    cache lifetime — treat it as a credential-handling system
 - **Unauthenticated HTTP is opt-in**: without OAuth or passthrough, the HTTP
   transport refuses to start unless `MCP_ALLOW_UNAUTHENTICATED_HTTP=true`
   acknowledges the risk (development only)
@@ -271,7 +274,8 @@ mcp-trino
 | TRINO_QUERY_TIMEOUT    | Query timeout in seconds          | 300       |
 | TRINO_MAX_ROWS         | Max rows returned per query (0 = unlimited) | 10000 |
 | TRINO_SOURCE           | Query source attribution (X-Trino-Source) | mcp-trino/<version> |
-| TRINO_AUTH_MODE        | Auth mode: `standard` (shared service account) or `passthrough` (per-user HTTP Basic credentials forwarded to Trino, e.g. LDAP; HTTP transport only; mutually exclusive with OAuth and impersonation; CLI: per-invocation credentials, see [passthrough.md](passthrough.md)) | standard |
+| TRINO_AUTH_MODE        | Auth mode: `standard` (shared service account) or `passthrough` (per-user HTTP Basic credentials or Bearer JWT tokens forwarded to Trino, e.g. LDAP or JWT/OIDC auth; HTTP transport only; mutually exclusive with OAuth and impersonation; CLI: per-invocation credentials, see [passthrough.md](passthrough.md)) | standard |
+| TRINO_ACCESS_TOKEN     | CLI only: bearer token (JWT) forwarded to Trino in passthrough mode, replacing user/password | (empty)   |
 | MCP_TRANSPORT          | Transport method (stdio/http)     | stdio     |
 | MCP_PORT               | HTTP port for http transport      | 8080      |
 | MCP_HOST               | Listen address for HTTP transport (containers need 0.0.0.0) | 127.0.0.1 |
