@@ -73,12 +73,24 @@ func TestIntegration_HelpFlag(t *testing.T) {
 	}
 }
 
+// isolatedHomeEnv returns a minimal environment with HOME pointed at a fresh
+// temp dir, so tests never read the developer's real ~/.config/trino config
+// file and never inherit TRINO_*/MCP_* exports from the developer's shell.
+func isolatedHomeEnv(t *testing.T, extra ...string) []string {
+	t.Helper()
+	env := []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + t.TempDir(),
+	}
+	return append(env, extra...)
+}
+
 func TestIntegration_CLICommandWithBadHost(t *testing.T) {
 	binary := buildTestBinary(t)
 
 	cmd := exec.Command(binary, "catalogs")
 	// Set a non-existent host to trigger connection error without trying to connect to real services
-	cmd.Env = append(os.Environ(), "TRINO_HOST=invalid-host-that-does-not-exist.local", "TRINO_PORT=9999")
+	cmd.Env = isolatedHomeEnv(t, "TRINO_HOST=invalid-host-that-does-not-exist.local", "TRINO_PORT=9999")
 
 	output, err := cmd.CombinedOutput()
 	outputStr := string(output)
@@ -130,7 +142,7 @@ func TestIntegration_FormatFlagValidation(t *testing.T) {
 	binary := buildTestBinary(t)
 
 	cmd := exec.Command(binary, "--format", "invalid-format", "catalogs")
-	cmd.Env = append(os.Environ(), "TRINO_HOST=localhost")
+	cmd.Env = isolatedHomeEnv(t, "TRINO_HOST=localhost")
 
 	output, err := cmd.CombinedOutput()
 	outputStr := string(output)
@@ -182,7 +194,7 @@ output:
 	}
 }
 
-func TestIntegration_ConfigOverridesEnvVar(t *testing.T) {
+func TestIntegration_EnvVarOverridesConfig(t *testing.T) {
 	binary := buildTestBinary(t)
 
 	// Create a temporary config file
@@ -198,25 +210,25 @@ trino:
 		t.Fatalf("Failed to write config file: %v", err)
 	}
 
-	// Test: Config file overrides env var (env vars are lowest priority)
+	// Test: Exported env var overrides config file profile (aws-cli convention)
+	// Precedence: CLI flags > env vars > profile > defaults
 	cmd := exec.Command(binary, "--config", configFile, "catalogs")
-	cmd.Env = append(os.Environ(),
-		"HOME="+tempDir,
-		"TRINO_HOST=from-env-host",
-	)
+	cmd.Env = append([]string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + tempDir,
+	}, "TRINO_HOST=from-env-host")
 
 	output, _ := cmd.CombinedOutput()
 	outputStr := string(output)
 
-	// Verify config host is used and env host is NOT used
-	// Precedence: CLI flags > --profile > TRINO_PROFILE > current > default > env vars
-	if !strings.Contains(outputStr, "from-config-host") {
+	// The connection attempt should target the env host, visible in the dial error
+	if !strings.Contains(outputStr, "from-env-host") {
 		t.Logf("Output: %s", outputStr)
-		t.Error("Expected config file host 'from-config-host' to be used, but it wasn't found in output")
+		t.Error("Expected env host 'from-env-host' to be used, but it wasn't found in output")
 	}
-	if strings.Contains(outputStr, "from-env-host") {
+	if strings.Contains(outputStr, "from-config-host") {
 		t.Logf("Output: %s", outputStr)
-		t.Error("Env var host 'from-env-host' should NOT be used when config file is set")
+		t.Error("Config file host 'from-config-host' should NOT be used when TRINO_HOST is exported")
 	}
 }
 
@@ -237,10 +249,10 @@ func TestIntegration_FlagOverridesEnv(t *testing.T) {
 
 	// Test: Flag overrides env var
 	cmd := exec.Command(binary, "--config", configFile, "--host", "from-flag-host", "catalogs")
-	cmd.Env = append(os.Environ(),
-		"HOME="+tempDir,
-		"TRINO_HOST=from-env-host",
-	)
+	cmd.Env = append([]string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + tempDir,
+	}, "TRINO_HOST=from-env-host")
 
 	output, _ := cmd.CombinedOutput()
 	outputStr := string(output)
@@ -265,7 +277,7 @@ func TestIntegration_ErrorPropagation(t *testing.T) {
 
 	// Test error propagation for bad host
 	cmd := exec.Command(binary, "query", "SELECT 1")
-	cmd.Env = append(os.Environ(),
+	cmd.Env = isolatedHomeEnv(t,
 		"TRINO_HOST=invalid-test-host.invalid",
 		"TRINO_PORT=9999",
 	)
@@ -317,7 +329,7 @@ func TestIntegration_ModeSelection_ExplicitCLI(t *testing.T) {
 
 	// --cli flag should force CLI mode even with MCP_PROTOCOL_VERSION
 	cmd := exec.Command(binary, "--cli", "catalogs")
-	cmd.Env = append(os.Environ(),
+	cmd.Env = isolatedHomeEnv(t,
 		"MCP_PROTOCOL_VERSION=1.0",
 		"TRINO_HOST=localhost",
 	)

@@ -132,6 +132,11 @@ func runCLI(stdout, stderr io.Writer, rawArgs []string) error {
 		}
 	}
 
+	// Validate the whole config (all profiles) before applying anything
+	if err := cliConfig.Validate(); err != nil {
+		return fmt.Errorf("invalid config: %w", err)
+	}
+
 	// Resolve profile
 	activeProfile := *profileName
 	if activeProfile == "" {
@@ -684,6 +689,18 @@ func runProfileShow(w io.Writer, cliConfig *cli.CLIConfig, name string) error {
 	}
 	if profile.SSL.Insecure {
 		_, _ = fmt.Fprintln(w, "  SSL Insecure: true")
+	}
+	if profile.Scheme != "" {
+		_, _ = fmt.Fprintf(w, "  Scheme: %s\n", profile.Scheme)
+	}
+	if profile.QueryTimeoutSeconds > 0 {
+		_, _ = fmt.Fprintf(w, "  Query Timeout: %ds\n", profile.QueryTimeoutSeconds)
+	}
+	if profile.MaxRows > 0 {
+		_, _ = fmt.Fprintf(w, "  Max Rows: %d\n", profile.MaxRows)
+	}
+	if profile.AllowWriteQueries != nil {
+		_, _ = fmt.Fprintf(w, "  Allow Write Queries: %v\n", *profile.AllowWriteQueries)
 	}
 	return nil
 }

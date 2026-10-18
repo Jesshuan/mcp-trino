@@ -392,8 +392,17 @@ func TestRunCLI_UsageError_UnknownCommand(t *testing.T) {
 }
 
 func TestRunCLI_UsageError_InvalidFormat(t *testing.T) {
+	// Hermetic: fixture config so the test doesn't read the developer's real
+	// ~/.config/trino file
+	tmpDir := t.TempDir()
+	configPath := tmpDir + "/config.json"
+	fixture := `{"current":"p","profiles":{"p":{"host":"h","port":8080,"user":"u"}}}`
+	if err := os.WriteFile(configPath, []byte(fixture), 0600); err != nil {
+		t.Fatalf("failed to write fixture config: %v", err)
+	}
+
 	var stdout, stderr bytes.Buffer
-	err := runCLI(&stdout, &stderr, []string{"--format", "xml", "catalogs"})
+	err := runCLI(&stdout, &stderr, []string{"--config", configPath, "--format", "xml", "catalogs"})
 	if err == nil {
 		t.Fatal("expected error for invalid format")
 	}
@@ -497,7 +506,7 @@ func TestRunCLI_MissingHost(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when host is missing")
 	}
-	if !strings.Contains(err.Error(), "host not set") {
-		t.Errorf("expected 'host not set' error, got: %v", err)
+	if !strings.Contains(err.Error(), "host") {
+		t.Errorf("expected 'host' validation error, got: %v", err)
 	}
 }
