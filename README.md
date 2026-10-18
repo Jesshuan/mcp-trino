@@ -200,6 +200,7 @@ profiles:
     password: prod_password
     catalog: hive
     schema: analytics
+    scheme: https
     ssl:
       enabled: true
       insecure: false
@@ -210,6 +211,9 @@ profiles:
     user: trino
     catalog: memory
     schema: default
+    scheme: http
+    query_timeout: 60        # seconds (TRINO_QUERY_TIMEOUT)
+    max_rows: 5000           # (TRINO_MAX_ROWS)
 
   staging:
     host: staging-trino.example.com
@@ -231,6 +235,7 @@ Or equivalently in JSON:
       "port": 443,
       "user": "prod_user",
       "catalog": "hive",
+      "scheme": "https",
       "ssl": { "enabled": true }
     },
     "dev": {
@@ -263,13 +268,15 @@ mcp-trino --profile dev catalogs
 
 **Configuration Precedence** (highest to lowest):
 1. CLI flags (`--host`, `--port`, etc.)
-2. `--profile` flag
-3. `TRINO_PROFILE` environment variable
-4. `current` field in config file
-5. `default` profile fallback
-6. Environment variables (`TRINO_HOST`, etc.)
+2. Exported environment variables (`TRINO_HOST`, etc.) — following the aws-cli/kubectl convention, an exported variable always wins over the profile value
+3. Active profile values (host, port, user, password, catalog, schema, scheme, ssl, query_timeout, max_rows, allow_write_queries, source)
+4. Built-in defaults
 
-**Environment Variables** (lowest priority - overridden by profiles and flags):
+> **Note:** profile *selection* is separate from value precedence: `--profile` flag > `TRINO_PROFILE` environment variable > `current` field in config file > `default` profile fallback.
+
+> **Tip:** if a stale `TRINO_PORT` or `TRINO_SCHEME` export silently overrides your profile, `unset` it — env beats profile by design.
+
+**Environment Variables** (fill gaps not covered by the profile):
 
 ```bash
 export TRINO_HOST=trino.example.com
