@@ -70,6 +70,55 @@ server):
 }
 ```
 
+## Testing with the CLI
+
+The CLI has no HTTP layer to carry Basic headers, so **each invocation is its
+own identity**: the credentials you run the command with are forwarded to
+Trino directly. `TRINO_USER` is *not* required.
+
+```bash
+export TRINO_AUTH_MODE=passthrough
+
+# Interactive: prompts "Trino user:" then "Trino password:" (masked)
+mcp-trino query 'SHOW SCHEMAS FROM tpch'
+
+# Explicit credentials — script/CI friendly
+mcp-trino --user alice --password '...' query 'SELECT 1'
+
+# REPL: credentials prompted once, every query runs as that identity
+mcp-trino interactive
+```
+
+A passthrough profile simply omits `user`:
+
+```yaml
+# ~/.config/trino/config.yaml
+current: ldap-dev
+
+profiles:
+  ldap-dev:
+    host: trino.internal
+    port: 8443
+    scheme: https
+    ssl:
+      enabled: true
+      insecure: false   # dev/self-signed only — verify certs in production
+```
+
+Scripted (non-TTY) runs without credentials fail explicitly instead of
+hanging on a prompt:
+
+```
+Error: TRINO_AUTH_MODE=passthrough requires per-invocation credentials:
+pass --user/--password or set TRINO_USER/TRINO_PASSWORD
+(no interactive terminal available)
+```
+
+Verify the negative case against a password-authenticated Trino: wrong
+credentials return `401 Unauthorized: Access Denied: Invalid credentials`,
+proving the identity really comes from the invocation and not from a shared
+account.
+
 ## Configuration
 
 | Variable | Default | Notes |

@@ -422,31 +422,41 @@ EXAMPLES
     mcp-trino config profile list
     mcp-trino config profile use prod
 
+    # Passthrough mode: prompt for per-invocation credentials
+    TRINO_AUTH_MODE=passthrough mcp-trino --profile ldap-dev query 'SELECT 1'
+
 ENVIRONMENT
     TRINO_HOST              Trino server hostname
     TRINO_PORT              Trino server port (default: 8080)
-    TRINO_USER              Trino username
+    TRINO_USER              Trino username (not required in passthrough mode)
     TRINO_PASSWORD          Trino password
     TRINO_CATALOG           Default catalog
     TRINO_SCHEMA            Default schema
+    TRINO_SCHEME            Connection scheme: http or https (default: https)
     TRINO_PROFILE           Profile name (same as --profile flag)
     TRINO_SSL               Enable SSL (true/false)
     TRINO_SSL_INSECURE      Skip SSL certificate verification (true/false)
     TRINO_ALLOW_WRITE_QUERIES  Allow write queries (default: false)
-    TRINO_QUERY_TIMEOUT     Query timeout in seconds (default: 30)
+    TRINO_QUERY_TIMEOUT     Query timeout in seconds (default: 300)
+    TRINO_MAX_ROWS          Max rows per query (default: 10000)
+    TRINO_SOURCE            Query source attribution (default: mcp-trino/<version>)
+    TRINO_AUTH_MODE         standard (service account) or passthrough (per-invocation credentials)
     NO_COLOR                Disable colored output when set
 
 CONFIGURATION
-    Config file: ~/.config/trino/config.json
+    Config file: ~/.config/trino/config.json (YAML config.yaml also supported)
 
-    Precedence (highest to lowest):
+    Value precedence (highest to lowest):
       1. CLI flags (--host, --user, etc.)
-      2. Profile from config file (--profile > TRINO_PROFILE > current)
-      3. Environment variables (TRINO_HOST, etc.)
-      4. Config file defaults
+      2. Exported environment variables (TRINO_HOST, etc.)
+      3. Active profile values (host, port, user, scheme, ssl, ...)
+      4. Built-in defaults
 
-    Note: Configuration uses JSON format. If migrating from an older YAML
-    config, convert ~/.config/trino/config.yaml to config.json manually.
+    Profile selection: --profile flag > TRINO_PROFILE > current > default
+
+    Note: an exported environment variable always wins over the profile
+    value (aws-cli/kubectl convention). Unset stale exports (e.g. an old
+    TRINO_PORT in .bashrc) if a profile value seems ignored.
 
 SEE ALSO
     Use '<command> --help' for more information about a specific command.

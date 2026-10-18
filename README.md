@@ -159,6 +159,30 @@ mcp-trino --format csv query "SELECT 1"
 mcp-trino --format table query "SELECT 1"  # default
 ```
 
+### Passthrough Mode from the CLI
+
+With `TRINO_AUTH_MODE=passthrough`, the CLI has no shared service account:
+**each invocation is its own identity**, and credentials are per-invocation —
+mirroring what MCP clients send as HTTP Basic headers in server mode.
+
+```bash
+# Interactive: you are prompted for the username, then the password (masked)
+TRINO_AUTH_MODE=passthrough mcp-trino --profile dev-passthrough query 'SELECT 1'
+
+# Explicit credentials (scripted / CI)
+TRINO_AUTH_MODE=passthrough mcp-trino --user alice --password '...' query 'SELECT 1'
+
+# Interactive REPL: credentials asked once, then every query runs as that identity
+TRINO_AUTH_MODE=passthrough mcp-trino --profile dev-passthrough interactive
+
+# Scripted run WITHOUT credentials fails explicitly (no hanging prompt):
+# Error: TRINO_AUTH_MODE=passthrough requires per-invocation credentials:
+#        pass --user/--password or set TRINO_USER/TRINO_PASSWORD
+```
+
+In passthrough mode a profile may omit `user` entirely (see
+[docs/passthrough.md](docs/passthrough.md) for the server-side setup).
+
 ### Built-in Help
 
 Every command has structured, LLM-friendly help output:
@@ -214,6 +238,17 @@ profiles:
     scheme: http
     query_timeout: 60        # seconds (TRINO_QUERY_TIMEOUT)
     max_rows: 5000           # (TRINO_MAX_ROWS)
+    allow_write_queries: false  # (TRINO_ALLOW_WRITE_QUERIES)
+
+  # Passthrough profile: no service-account user — credentials are provided
+  # per invocation (prompt, --user/--password, or environment)
+  ldap-dev:
+    host: trino.internal
+    port: 8443
+    scheme: https
+    ssl:
+      enabled: true
+      insecure: false
 
   staging:
     host: staging-trino.example.com
@@ -285,7 +320,11 @@ export TRINO_USER=myuser
 export TRINO_PASSWORD=mypass
 export TRINO_CATALOG=hive
 export TRINO_SCHEMA=analytics
+export TRINO_SCHEME=https          # http or https (default: https)
 export TRINO_SSL=true
+export TRINO_MAX_ROWS=10000        # rows per query (default: 10000)
+export TRINO_QUERY_TIMEOUT=300     # seconds (default: 300)
+# TRINO_AUTH_MODE=passthrough      # per-user credentials; CLI prompts per invocation
 ```
 
 **Secret Management** (recommended):
