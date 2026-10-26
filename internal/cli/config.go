@@ -20,7 +20,13 @@ type TrinoProfileConfig struct {
 	Catalog  string    `json:"catalog,omitempty" yaml:"catalog,omitempty"`
 	Schema   string    `json:"schema,omitempty" yaml:"schema,omitempty"`
 	Source   string    `json:"source,omitempty" yaml:"source,omitempty"`
+	Scheme   string    `json:"scheme,omitempty" yaml:"scheme,omitempty"` // Connection scheme: "http" or "https" (TRINO_SCHEME)
 	SSL      SSLConfig `json:"ssl,omitempty" yaml:"ssl,omitempty"`
+
+	// Optional connection behavior (0/unset = leave env var untouched)
+	QueryTimeoutSeconds int   `json:"query_timeout,omitempty" yaml:"query_timeout,omitempty"`             // Seconds (TRINO_QUERY_TIMEOUT)
+	MaxRows             int   `json:"max_rows,omitempty" yaml:"max_rows,omitempty"`                       // Row limit (TRINO_MAX_ROWS)
+	AllowWriteQueries   *bool `json:"allow_write_queries,omitempty" yaml:"allow_write_queries,omitempty"` // Pointer: only applied when explicitly set (TRINO_ALLOW_WRITE_QUERIES)
 }
 
 // SSLConfig holds SSL configuration for a profile
@@ -280,8 +286,15 @@ func (c *CLIConfig) Validate() error {
 		if profile.Port <= 0 {
 			return fmt.Errorf("profile '%s' has invalid port '%d'", name, profile.Port)
 		}
-		if profile.User == "" {
-			return fmt.Errorf("profile '%s' is missing required field 'user'", name)
+		// user is optional: passthrough profiles omit it (per-request credentials)
+		if profile.Scheme != "" && !strings.EqualFold(profile.Scheme, "http") && !strings.EqualFold(profile.Scheme, "https") {
+			return fmt.Errorf("profile '%s' has invalid scheme '%s' (must be http or https)", name, profile.Scheme)
+		}
+		if profile.QueryTimeoutSeconds < 0 {
+			return fmt.Errorf("profile '%s' has invalid query_timeout '%d' (must be a positive number of seconds)", name, profile.QueryTimeoutSeconds)
+		}
+		if profile.MaxRows < 0 {
+			return fmt.Errorf("profile '%s' has invalid max_rows '%d' (must be non-negative)", name, profile.MaxRows)
 		}
 	}
 
@@ -298,27 +311,40 @@ func (c *CLIConfig) SetCurrent(name string) error {
 	return SaveCLIConfig(c)
 }
 
-// ApplyToEnv applies CLI config to environment variables
+// ApplyToEnv applies the active profile to environment variables.
+// Exported environment variables take precedence over profile values
+// (aws-cli/kubectl convention): only unset variables are filled in from
+// the profile. CLI flags, applied afterwards, still win over both.
 func (c *CLIConfig) ApplyToEnv(profileName string) error {
 	profile, err := c.GetActiveProfile(profileName)
 	if err != nil {
 		return err
 	}
 
-	setEnvIfValue("TRINO_HOST", profile.Host)
+	setEnvIfUnset("TRINO_HOST", profile.Host)
 	if profile.Port > 0 {
-		setEnvIfValue("TRINO_PORT", fmt.Sprintf("%d", profile.Port))
+		setEnvIfUnset("TRINO_PORT", fmt.Sprintf("%d", profile.Port))
 	}
-	setEnvIfValue("TRINO_USER", profile.User)
-	setEnvIfValue("TRINO_PASSWORD", profile.Password)
-	setEnvIfValue("TRINO_CATALOG", profile.Catalog)
-	setEnvIfValue("TRINO_SCHEMA", profile.Schema)
+	setEnvIfUnset("TRINO_USER", profile.User)
+	setEnvIfUnset("TRINO_PASSWORD", profile.Password)
+	setEnvIfUnset("TRINO_CATALOG", profile.Catalog)
+	setEnvIfUnset("TRINO_SCHEMA", profile.Schema)
+	setEnvIfUnset("TRINO_SCHEME", profile.Scheme)
 	if profile.Source != "" {
-		setEnvIfValue("TRINO_SOURCE", profile.Source)
+		setEnvIfUnset("TRINO_SOURCE", profile.Source)
 	}
 	if profile.SSL.Enabled != nil {
-		setEnvIfValue("TRINO_SSL", fmt.Sprintf("%t", *profile.SSL.Enabled))
-		setEnvIfValue("TRINO_SSL_INSECURE", fmt.Sprintf("%t", profile.SSL.Insecure))
+		setEnvIfUnset("TRINO_SSL", fmt.Sprintf("%t", *profile.SSL.Enabled))
+		setEnvIfUnset("TRINO_SSL_INSECURE", fmt.Sprintf("%t", profile.SSL.Insecure))
+	}
+	if profile.QueryTimeoutSeconds > 0 {
+		setEnvIfUnset("TRINO_QUERY_TIMEOUT", fmt.Sprintf("%d", profile.QueryTimeoutSeconds))
+	}
+	if profile.MaxRows > 0 {
+		setEnvIfUnset("TRINO_MAX_ROWS", fmt.Sprintf("%d", profile.MaxRows))
+	}
+	if profile.AllowWriteQueries != nil {
+		setEnvIfUnset("TRINO_ALLOW_WRITE_QUERIES", fmt.Sprintf("%t", *profile.AllowWriteQueries))
 	}
 	return nil
 }
@@ -331,9 +357,12 @@ func (c *CLIConfig) GetOutputFormat() string {
 	return c.Output.Format
 }
 
-func setEnvIfValue(key, value string) {
+func setEnvIfUnset(key, value string) {
 	if value == "" {
 		return
+	}
+	if _, exists := os.LookupEnv(key); exists {
+		return // already exported in the environment: env wins over profile
 	}
 	_ = os.Setenv(key, value)
 }

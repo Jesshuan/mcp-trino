@@ -18,6 +18,9 @@ data:
   MCP_TRANSPORT: {{ .Values.mcpServer.transport | quote }}
   MCP_HOST: {{ .Values.mcpServer.host | quote }}
   MCP_PORT: {{ .Values.mcpServer.port | quote }}
+  {{- if .Values.mcpServer.allowUnauthenticatedHttp }}
+  MCP_ALLOW_UNAUTHENTICATED_HTTP: "true"
+  {{- end }}
   {{- if .Values.trino.allowlists.catalogs }}
   TRINO_ALLOWED_CATALOGS: {{ .Values.trino.allowlists.catalogs | join "," | quote }}
   {{- end }}

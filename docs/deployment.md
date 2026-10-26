@@ -12,8 +12,9 @@ The server supports two transport methods:
 ### HTTP Transport with StreamableHTTP
 - **Modern approach**: Uses the `/mcp` endpoint with StreamableHTTP protocol
 - **Legacy support**: Maintains `/sse` endpoint for backward compatibility with SSE
-- Supports web-based MCP clients
-- Enables JWT authentication for secure access
+- Supports remote MCP clients (Claude Code, agents, IDEs)
+- Enables authentication for secure access (OAuth or credential passthrough)
+- Binds to `MCP_HOST` (default `127.0.0.1` — loopback only; containers must set `0.0.0.0`)
 
 ## OAuth 2.0 Authentication
 
@@ -54,6 +55,25 @@ Authorization: Bearer <your-jwt-token>
 ```
 
 For detailed OAuth configuration, deployment examples, and browser-based MCP client compatibility lessons learned, see [oauth.md](oauth.md).
+
+## Per-User Credential Passthrough (LDAP)
+
+Alternative to OAuth when your Trino uses **password-based authentication (LDAP)**: clients send HTTP Basic credentials, mcp-trino forwards them to Trino per request, and Trino authenticates the real user — per-user ACLs and audit for free.
+
+```bash
+export TRINO_AUTH_MODE=passthrough
+export MCP_TRANSPORT=http
+export TRINO_SCHEME=https
+mcp-trino
+```
+
+Requests without credentials get `401` with a `WWW-Authenticate: Basic` challenge. No `TRINO_PASSWORD` needed — users supply their own. TLS is mandatory in practice (user passwords transit the server on every request).
+
+See [passthrough.md](passthrough.md) for the full guide, including the connection cache, credential rotation handling, and security requirements.
+
+> The HTTP server refuses to start without authentication (no OAuth, no
+> passthrough) unless `MCP_ALLOW_UNAUTHENTICATED_HTTP=true` is set
+> explicitly — a development-only opt-in.
 
 ## HTTPS Support
 
@@ -181,6 +201,20 @@ docker run -d -p 8080:8080 \
   - Implement proper issuer (`iss`) and audience (`aud`) validation
   - Use established OAuth 2.1/OpenID Connect providers
   - Implement token revocation mechanisms
+- **Credential Passthrough** (see [passthrough.md](passthrough.md)):
+  - User passwords transit the server on every request — TLS is mandatory
+    (terminate at the server or at a proxy in front)
+  - Credentials travel only in the `Authorization: Basic`/`Authorization: Bearer`
+    header, never in tool arguments (which can end up in LLM transcripts) or URLs
+  - Bearer tokens are forwarded to Trino **without validation** — Trino's
+    JWT/OIDC authenticator is the only validator; protect the MCP endpoint at
+    the network level accordingly
+  - Keep Trino TLS verification enabled (`TRINO_SSL_INSECURE=false`)
+  - The server holds user passwords and tokens in memory for the connection
+    cache lifetime — treat it as a credential-handling system
+- **Unauthenticated HTTP is opt-in**: without OAuth or passthrough, the HTTP
+  transport refuses to start unless `MCP_ALLOW_UNAUTHENTICATED_HTTP=true`
+  acknowledges the risk (development only)
 
 ## Quick Start with OAuth
 
@@ -235,12 +269,17 @@ mcp-trino
 | TRINO_SCHEMA           | Default schema                    | default   |
 | TRINO_SCHEME           | Connection scheme (http/https)    | https     |
 | TRINO_SSL              | Enable SSL                        | true      |
-| TRINO_SSL_INSECURE     | Allow insecure SSL                | true      |
+| TRINO_SSL_INSECURE     | Skip TLS certificate verification (dev/self-signed only — vulnerable to MITM) | false     |
 | TRINO_ALLOW_WRITE_QUERIES | Allow non-read-only SQL queries | false     |
-| TRINO_QUERY_TIMEOUT    | Query timeout in seconds          | 30        |
+| TRINO_QUERY_TIMEOUT    | Query timeout in seconds          | 300       |
+| TRINO_MAX_ROWS         | Max rows returned per query (0 = unlimited) | 10000 |
+| TRINO_SOURCE           | Query source attribution (X-Trino-Source) | mcp-trino/<version> |
+| TRINO_AUTH_MODE        | Auth mode: `standard` (shared service account) or `passthrough` (per-user HTTP Basic credentials or Bearer JWT tokens forwarded to Trino, e.g. LDAP or JWT/OIDC auth; HTTP transport only; mutually exclusive with OAuth and impersonation; CLI: per-invocation credentials, see [passthrough.md](passthrough.md)) | standard |
+| TRINO_ACCESS_TOKEN     | CLI only: bearer token (JWT) forwarded to Trino in passthrough mode, replacing user/password | (empty)   |
 | MCP_TRANSPORT          | Transport method (stdio/http)     | stdio     |
 | MCP_PORT               | HTTP port for http transport      | 8080      |
-| MCP_HOST               | Host for HTTP callbacks           | localhost |
+| MCP_HOST               | Listen address for HTTP transport (containers need 0.0.0.0) | 127.0.0.1 |
+| MCP_ALLOW_UNAUTHENTICATED_HTTP | Dev-only opt-in to run HTTP transport without OAuth. The server refuses to start otherwise | false |
 | MCP_URL                | Public base URL of MCP server (used for OAuth metadata and client discovery); required for remote deployments | http://localhost:8080 |
 | OAUTH_ENABLED    | Enable OAuth authentication | false |
 | OAUTH_PROVIDER         | OAuth provider (hmac/okta/google/azure) | hmac |

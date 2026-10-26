@@ -392,8 +392,20 @@ func TestRunCLI_UsageError_UnknownCommand(t *testing.T) {
 }
 
 func TestRunCLI_UsageError_InvalidFormat(t *testing.T) {
+	// Hermetic: fixture config so the test doesn't read the developer's real
+	// ~/.config/trino file, and pinned auth env so ambient TRINO_AUTH_MODE or
+	// OAUTH_ENABLED exports cannot fail config loading before flag validation
+	t.Setenv("TRINO_AUTH_MODE", "standard")
+	t.Setenv("OAUTH_ENABLED", "false")
+	tmpDir := t.TempDir()
+	configPath := tmpDir + "/config.json"
+	fixture := `{"current":"p","profiles":{"p":{"host":"h","port":8080,"user":"u"}}}`
+	if err := os.WriteFile(configPath, []byte(fixture), 0600); err != nil {
+		t.Fatalf("failed to write fixture config: %v", err)
+	}
+
 	var stdout, stderr bytes.Buffer
-	err := runCLI(&stdout, &stderr, []string{"--format", "xml", "catalogs"})
+	err := runCLI(&stdout, &stderr, []string{"--config", configPath, "--format", "xml", "catalogs"})
 	if err == nil {
 		t.Fatal("expected error for invalid format")
 	}
@@ -403,16 +415,18 @@ func TestRunCLI_UsageError_InvalidFormat(t *testing.T) {
 }
 
 func TestRunCLI_UsageError_QueryNoArg(t *testing.T) {
-	// Set required env vars so we get past config validation
-	_ = os.Setenv("TRINO_HOST", "localhost")
-	_ = os.Setenv("TRINO_USER", "test")
-	t.Cleanup(func() {
-		_ = os.Unsetenv("TRINO_HOST")
-		_ = os.Unsetenv("TRINO_USER")
-	})
+	// Hermetic: fixture config + pinned auth env (see TestRunCLI_UsageError_InvalidFormat)
+	t.Setenv("TRINO_AUTH_MODE", "standard")
+	t.Setenv("OAUTH_ENABLED", "false")
+	tmpDir := t.TempDir()
+	configPath := tmpDir + "/config.json"
+	fixture := `{"current":"p","profiles":{"p":{"host":"h","port":8080,"user":"u"}}}`
+	if err := os.WriteFile(configPath, []byte(fixture), 0600); err != nil {
+		t.Fatalf("failed to write fixture config: %v", err)
+	}
 
 	var stdout, stderr bytes.Buffer
-	err := runCLI(&stdout, &stderr, []string{"query"})
+	err := runCLI(&stdout, &stderr, []string{"--config", configPath, "query"})
 	if err == nil {
 		t.Fatal("expected error for query with no SQL arg")
 	}
@@ -422,15 +436,18 @@ func TestRunCLI_UsageError_QueryNoArg(t *testing.T) {
 }
 
 func TestRunCLI_UsageError_DescribeNoArg(t *testing.T) {
-	_ = os.Setenv("TRINO_HOST", "localhost")
-	_ = os.Setenv("TRINO_USER", "test")
-	t.Cleanup(func() {
-		_ = os.Unsetenv("TRINO_HOST")
-		_ = os.Unsetenv("TRINO_USER")
-	})
+	// Hermetic: fixture config + pinned auth env (see TestRunCLI_UsageError_InvalidFormat)
+	t.Setenv("TRINO_AUTH_MODE", "standard")
+	t.Setenv("OAUTH_ENABLED", "false")
+	tmpDir := t.TempDir()
+	configPath := tmpDir + "/config.json"
+	fixture := `{"current":"p","profiles":{"p":{"host":"h","port":8080,"user":"u"}}}`
+	if err := os.WriteFile(configPath, []byte(fixture), 0600); err != nil {
+		t.Fatalf("failed to write fixture config: %v", err)
+	}
 
 	var stdout, stderr bytes.Buffer
-	err := runCLI(&stdout, &stderr, []string{"describe"})
+	err := runCLI(&stdout, &stderr, []string{"--config", configPath, "describe"})
 	if err == nil {
 		t.Fatal("expected error for describe with no table arg")
 	}
@@ -484,6 +501,10 @@ func TestRunCLI_NoError_SubcommandHelp(t *testing.T) {
 }
 
 func TestRunCLI_MissingHost(t *testing.T) {
+	// Pin auth env so ambient TRINO_AUTH_MODE/OAUTH_ENABLED exports cannot
+	// alter which validation fires; the test targets the host requirement
+	t.Setenv("TRINO_AUTH_MODE", "standard")
+	t.Setenv("OAUTH_ENABLED", "false")
 	// Use a profile that doesn't set host to override defaults
 	tmpDir := t.TempDir()
 	configPath := tmpDir + "/config.json"
@@ -497,7 +518,131 @@ func TestRunCLI_MissingHost(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when host is missing")
 	}
-	if !strings.Contains(err.Error(), "host not set") {
-		t.Errorf("expected 'host not set' error, got: %v", err)
+	if !strings.Contains(err.Error(), "host") {
+		t.Errorf("expected 'host' validation error, got: %v", err)
+	}
+}
+
+// replaceStdin points os.Stdin at /dev/null for the duration of the test,
+// guaranteeing non-terminal stdin regardless of how go test was invoked.
+func replaceStdin(t *testing.T) {
+	t.Helper()
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatalf("failed to open /dev/null: %v", err)
+	}
+	oldStdin := os.Stdin
+	os.Stdin = devNull
+	t.Cleanup(func() {
+		os.Stdin = oldStdin
+		_ = devNull.Close()
+	})
+}
+
+// TestRunCLI_PassthroughNoCredentialsNonTTY verifies that passthrough mode
+// without any credentials fails with a passthrough-specific error instead of
+// the generic "user not set" (non-interactive context: no prompt possible).
+func TestRunCLI_PassthroughNoCredentialsNonTTY(t *testing.T) {
+	replaceStdin(t)
+
+	tmpDir := t.TempDir()
+	configPath := tmpDir + "/config.json"
+	fixture := `{"current":"p","profiles":{"p":{"host":"h","port":8443}}}` // no user in profile
+	if err := os.WriteFile(configPath, []byte(fixture), 0600); err != nil {
+		t.Fatalf("failed to write fixture config: %v", err)
+	}
+
+	t.Setenv("TRINO_AUTH_MODE", "passthrough")
+	t.Setenv("TRINO_USER", "")
+	t.Setenv("TRINO_PASSWORD", "")
+	t.Setenv("TRINO_ACCESS_TOKEN", "")
+
+	var stdout, stderr bytes.Buffer
+	err := runCLI(&stdout, &stderr, []string{"--config", configPath, "catalogs"})
+	if err == nil {
+		t.Fatal("expected error when passthrough mode has no credentials in non-TTY context")
+	}
+	if !strings.Contains(err.Error(), "passthrough") {
+		t.Errorf("expected passthrough-specific error, got: %v", err)
+	}
+}
+
+// TestRunCLI_PassthroughWithUserProceeds verifies that passthrough mode with
+// per-invocation credentials gets past the user requirement and attempts the
+// connection (fails here on an unresolvable host, which is expected).
+func TestRunCLI_PassthroughWithUserProceeds(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := tmpDir + "/config.json"
+	fixture := `{"current":"p","profiles":{"p":{"host":"invalid-test-host.invalid","port":8443}}}`
+	if err := os.WriteFile(configPath, []byte(fixture), 0600); err != nil {
+		t.Fatalf("failed to write fixture config: %v", err)
+	}
+
+	t.Setenv("TRINO_AUTH_MODE", "passthrough")
+	t.Setenv("TRINO_USER", "invoked-user")
+	t.Setenv("TRINO_PASSWORD", "invoked-password")
+	t.Setenv("TRINO_ACCESS_TOKEN", "")
+
+	var stdout, stderr bytes.Buffer
+	err := runCLI(&stdout, &stderr, []string{"--config", configPath, "catalogs"})
+	if err == nil {
+		t.Fatal("expected connection failure against invalid host")
+	}
+	if !strings.Contains(err.Error(), "failed") {
+		t.Errorf("expected connection error, got: %v", err)
+	}
+}
+
+// TestRunCLI_PassthroughWithTokenProceeds verifies that in passthrough mode a
+// bearer token (TRINO_ACCESS_TOKEN / --access-token) replaces Basic
+// credentials entirely: no user is needed and the request proceeds.
+func TestRunCLI_PassthroughWithTokenProceeds(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := tmpDir + "/config.json"
+	fixture := `{"current":"p","profiles":{"p":{"host":"invalid-test-host.invalid","port":8443}}}`
+	if err := os.WriteFile(configPath, []byte(fixture), 0600); err != nil {
+		t.Fatalf("failed to write fixture config: %v", err)
+	}
+
+	t.Setenv("TRINO_AUTH_MODE", "passthrough")
+	t.Setenv("TRINO_USER", "")
+	t.Setenv("TRINO_PASSWORD", "")
+	t.Setenv("TRINO_ACCESS_TOKEN", "aaa.eyJzdWIiOiJhbGljZSJ0.sig")
+
+	var stdout, stderr bytes.Buffer
+	err := runCLI(&stdout, &stderr, []string{"--config", configPath, "catalogs"})
+	if err == nil {
+		t.Fatal("expected connection failure against invalid host")
+	}
+	if strings.Contains(err.Error(), "user not set") || strings.Contains(err.Error(), "requires per-invocation credentials") {
+		t.Errorf("token must satisfy the credential requirement, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "failed") {
+		t.Errorf("expected connection error, got: %v", err)
+	}
+}
+
+// TestRunCLI_StandardModeStillRequiresUser verifies standard mode keeps the
+// TRINO_USER requirement (passthrough relaxation must not leak into it).
+func TestRunCLI_StandardModeStillRequiresUser(t *testing.T) {
+	replaceStdin(t)
+
+	tmpDir := t.TempDir()
+	configPath := tmpDir + "/config.json"
+	fixture := `{"current":"p","profiles":{"p":{"host":"h","port":8443}}}` // no user
+	if err := os.WriteFile(configPath, []byte(fixture), 0600); err != nil {
+		t.Fatalf("failed to write fixture config: %v", err)
+	}
+
+	t.Setenv("TRINO_AUTH_MODE", "")
+	t.Setenv("TRINO_USER", "")
+
+	var stdout, stderr bytes.Buffer
+	err := runCLI(&stdout, &stderr, []string{"--config", configPath, "catalogs"})
+	if err == nil {
+		t.Fatal("expected 'user not set' error in standard mode without user")
+	}
+	if !strings.Contains(err.Error(), "user not set") {
+		t.Errorf("expected 'user not set' error, got: %v", err)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -67,9 +68,44 @@ func (s *Server) ServeStdio() error {
 	return mcpserver.ServeStdio(s.mcpServer)
 }
 
+// listenAddr returns the address the HTTP server binds to. MCP_HOST is the
+// actual listen address (default: loopback only). Containers must set
+// MCP_HOST=0.0.0.0 explicitly to be reachable through the container
+// network interface.
+func listenAddr(port string) string {
+	host := getEnv("MCP_HOST", "127.0.0.1")
+	return fmt.Sprintf("%s:%s", host, port)
+}
+
+// validateHTTPAuth enforces that a network-facing HTTP server runs with
+// authentication (OAuth or credential passthrough) unless the operator
+// explicitly opts in to running unauthenticated. Without this, a default
+// HTTP deployment exposes the full query surface to anyone who can reach
+// the port.
+func (s *Server) validateHTTPAuth() error {
+	if s.config.OAuthEnabled || s.config.AuthMode == "passthrough" {
+		return nil
+	}
+	optIn, _ := parseBoolEnv("MCP_ALLOW_UNAUTHENTICATED_HTTP")
+	if !optIn {
+		return fmt.Errorf("refusing to start HTTP transport without authentication: " +
+			"enable OAuth (OAUTH_ENABLED=true), use credential passthrough " +
+			"(TRINO_AUTH_MODE=passthrough), or explicitly acknowledge the risk with " +
+			"MCP_ALLOW_UNAUTHENTICATED_HTTP=true (development only)")
+	}
+	log.Println("WARNING: HTTP transport is running UNAUTHENTICATED " +
+		"(MCP_ALLOW_UNAUTHENTICATED_HTTP=true). Anyone who can reach this endpoint " +
+		"can execute queries with the configured Trino credentials.")
+	return nil
+}
+
 // ServeHTTP starts the MCP server with HTTP transport
 func (s *Server) ServeHTTP(port string) error {
-	addr := fmt.Sprintf(":%s", port)
+	addr := listenAddr(port)
+
+	if err := s.validateHTTPAuth(); err != nil {
+		return err
+	}
 
 	log.Println("Setting up StreamableHTTP server...")
 
@@ -109,6 +145,14 @@ func (s *Server) ServeHTTP(port string) error {
 	go func() {
 		certFile := getEnv("HTTPS_CERT_FILE", "")
 		keyFile := getEnv("HTTPS_KEY_FILE", "")
+
+		// User passwords transit the server in passthrough mode: warn loudly
+		// when they would travel in cleartext (no local TLS, no mention of a
+		// TLS-terminating proxy in front).
+		if s.config.AuthMode == "passthrough" && certFile == "" && keyFile == "" {
+			log.Println("WARNING: Passthrough mode over plain HTTP: user passwords are transmitted in cleartext. " +
+				"Configure HTTPS_CERT_FILE/HTTPS_KEY_FILE or place a TLS-terminating proxy in front of this server.")
+		}
 
 		mcpHost := getEnv("MCP_HOST", "localhost")
 		mcpPort := getEnv("MCP_PORT", "8080")
@@ -169,14 +213,11 @@ func (s *Server) ServeHTTP(port string) error {
 // createMCPHandler creates the shared MCP handler function
 func (s *Server) createMCPHandler(streamableServer *mcpserver.StreamableHTTPServer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
+		// No CORS headers: this server serves MCP clients (Claude Code,
+		// agents, IDEs), not browsers. Emitting Access-Control-Allow-Origin
+		// would let any website read responses from a victim's browser
+		// (drive-by data exfiltration). Browser-based clients, if ever
+		// needed, require an explicit CORS allowlist (not yet implemented).
 
 		log.Printf("MCP %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
 
@@ -210,7 +251,50 @@ func (s *Server) createMCPHandler(streamableServer *mcpserver.StreamableHTTPServ
 			r = r.WithContext(ctx)
 		}
 
+		// Passthrough mode: extract credentials from the Authorization header
+		// and attach them to the request context. Both HTTP Basic credentials
+		// and bearer tokens (JWT) are accepted and forwarded to Trino, which
+		// does the actual authentication. They are never logged.
+		if s.config.AuthMode == "passthrough" {
+			authHeader := r.Header.Get("Authorization")
+			switch {
+			case strings.HasPrefix(authHeader, "Bearer "):
+				token := strings.TrimPrefix(authHeader, "Bearer ")
+				if token == "" {
+					log.Printf("Passthrough: empty bearer token from %s, returning 401", r.RemoteAddr)
+					passthroughUnauthorized(w)
+					return
+				}
+				r = r.WithContext(trino.WithAccessToken(r.Context(), token))
+			default:
+				user, password, ok := r.BasicAuth()
+				if !ok {
+					log.Printf("Passthrough: no Basic or Bearer credentials from %s, returning 401", r.RemoteAddr)
+					passthroughUnauthorized(w)
+					return
+				}
+				r = r.WithContext(trino.WithBasicCredentials(r.Context(), user, password))
+			}
+		}
+
 		streamableServer.ServeHTTP(w, r)
+	}
+}
+
+// passthroughUnauthorized responds 401 challenging the client with both
+// accepted schemes: HTTP Basic credentials and bearer tokens (JWT). Both are
+// forwarded to Trino, which performs the actual authentication.
+func passthroughUnauthorized(w http.ResponseWriter) {
+	w.Header().Add("WWW-Authenticate", `Basic realm="trino", charset="UTF-8"`)
+	w.Header().Add("WWW-Authenticate", `Bearer realm="trino"`)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnauthorized)
+	errorResponse := map[string]string{
+		"error":             "invalid_credentials",
+		"error_description": "HTTP Basic or Bearer authentication required (credentials are forwarded to Trino)",
+	}
+	if err := json.NewEncoder(w).Encode(errorResponse); err != nil {
+		log.Printf("Error encoding auth error response: %v", err)
 	}
 }
 
@@ -254,7 +338,6 @@ func (s *Server) getOAuthStatusWithWarning() string {
 	return " (OAuth disabled)"
 }
 
-
 func trinoConfigToOAuthConfig(cfg *config.TrinoConfig) *oauth.Config {
 	serverURL := getEnv("MCP_URL", "")
 	if serverURL == "" {
@@ -286,4 +369,17 @@ func getEnv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// parseBoolEnv reads a boolean environment variable (default: false)
+func parseBoolEnv(key string) (bool, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return false, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("invalid %s value '%s': must be a boolean", key, v)
+	}
+	return b, nil
 }

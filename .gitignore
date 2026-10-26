@@ -34,3 +34,6 @@ vendor/
 .claude/
 .claude/harness/
 trash/
+
+#keystore
+trino-conf/keystore.jks

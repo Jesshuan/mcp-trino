@@ -49,6 +49,11 @@ type TrinoConfig struct {
 
 	// Query attribution
 	TrinoSource string // Value for X-Trino-Source header (identifies query source to Trino)
+
+	// Authentication mode: "standard" (shared service account) or
+	// "passthrough" (per-user HTTP Basic credentials forwarded to Trino,
+	// e.g. LDAP; requires the HTTP transport)
+	AuthMode string
 }
 
 // NewTrinoConfig creates a new TrinoConfig with values from environment variables or defaults
@@ -62,7 +67,14 @@ func NewTrinoConfigWithVersion(version string) (*TrinoConfig, error) {
 
 	port, _ := strconv.Atoi(resolveEnv("TRINO_PORT", "8080"))
 	ssl, _ := strconv.ParseBool(resolveEnv("TRINO_SSL", "true"))
-	sslInsecure, _ := strconv.ParseBool(resolveEnv("TRINO_SSL_INSECURE", "true"))
+	// TLS certificate verification is ON by default. TRINO_SSL_INSECURE=true
+	// disables server identity verification (development/self-signed only).
+	sslInsecureStr := resolveEnv("TRINO_SSL_INSECURE", "false")
+	sslInsecure, insecureErr := strconv.ParseBool(sslInsecureStr)
+	if insecureErr != nil {
+		log.Printf("WARNING: Invalid TRINO_SSL_INSECURE '%s': not a boolean. Using secure default (false).", sslInsecureStr)
+		sslInsecure = false
+	}
 	scheme := resolveEnv("TRINO_SCHEME", "https")
 	allowWriteQueries, _ := strconv.ParseBool(resolveEnv("TRINO_ALLOW_WRITE_QUERIES", "false"))
 
@@ -147,6 +159,14 @@ func NewTrinoConfigWithVersion(version string) (*TrinoConfig, error) {
 		ssl = true
 	}
 
+	// Loud warning when certificate verification is disabled
+	if sslInsecure {
+		log.Println("WARNING: TLS certificate verification is DISABLED (TRINO_SSL_INSECURE=true). " +
+			"Connections are encrypted but the server's identity is NOT verified, leaving them " +
+			"vulnerable to man-in-the-middle attacks. Use only in development/test environments; " +
+			"for self-signed certificates, trust your internal CA instead.")
+	}
+
 	// Log a warning if write queries are allowed
 	if allowWriteQueries {
 		log.Println("WARNING: Write queries are enabled (TRINO_ALLOW_WRITE_QUERIES=true). SQL injection protection is bypassed.")
@@ -200,6 +220,30 @@ func NewTrinoConfigWithVersion(version string) (*TrinoConfig, error) {
 	// Log query attribution configuration
 	log.Printf("INFO: Trino query source attribution: %s", trinoSource)
 
+	// Parse authentication mode: shared service account or per-user passthrough
+	authMode := strings.ToLower(resolveEnv("TRINO_AUTH_MODE", "standard"))
+	if authMode == "" {
+		authMode = "standard"
+	}
+	validAuthModes := map[string]bool{"standard": true, "passthrough": true}
+	if !validAuthModes[authMode] {
+		return nil, fmt.Errorf("invalid TRINO_AUTH_MODE '%s'. Supported modes: standard, passthrough", authMode)
+	}
+	if authMode == "passthrough" && oauthEnabled {
+		return nil, fmt.Errorf("TRINO_AUTH_MODE=passthrough and OAUTH_ENABLED=true are mutually exclusive: " +
+			"passthrough forwards client Basic credentials directly to Trino, OAuth validates tokens at the MCP layer")
+	}
+	if authMode == "passthrough" && enableImpersonation {
+		return nil, fmt.Errorf("TRINO_AUTH_MODE=passthrough and TRINO_ENABLE_IMPERSONATION=true are mutually exclusive: " +
+			"in passthrough mode queries already run as the authenticated user")
+	}
+	if authMode == "passthrough" {
+		log.Println("INFO: Per-user credential passthrough enabled (TRINO_AUTH_MODE=passthrough). " +
+			"Client HTTP Basic credentials or Bearer tokens (JWT) are forwarded to Trino per request " +
+			"(e.g. LDAP or JWT/OIDC authentication). " +
+			"Requires MCP_TRANSPORT=http; keep the endpoint behind TLS.")
+	}
+
 	return &TrinoConfig{
 		Host:                resolveEnv("TRINO_HOST", "localhost"),
 		Port:                port,
@@ -228,6 +272,7 @@ func NewTrinoConfigWithVersion(version string) (*TrinoConfig, error) {
 		EnableImpersonation: enableImpersonation,
 		ImpersonationField:  impersonationField,
 		TrinoSource:         trinoSource,
+		AuthMode:            authMode,
 	}, nil
 }
 

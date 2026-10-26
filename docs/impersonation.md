@@ -7,7 +7,7 @@ mcp-trino provides two complementary features for user identity tracking:
 | Feature | Header | Purpose | Requires Config |
 |---------|--------|---------|-----------------|
 | **User Impersonation** | `X-Trino-User` | Execute queries as the actual user (affects permissions) | `TRINO_ENABLE_IMPERSONATION=true` |
-| **Query Attribution** | `X-Trino-Client-Tags`, `X-Trino-Client-Info` | Track who initiated queries (for auditing/monitoring) | OAuth enabled only |
+| **Query Attribution** | `X-Trino-Client-Tags`, `X-Trino-Client-Info` | Track who initiated queries (for auditing/monitoring) | OAuth or passthrough mode |
 
 **Key Difference:**
 - **Impersonation** changes *who* Trino thinks is running the query (affects access control)
@@ -66,6 +66,16 @@ export TRINO_ENABLE_IMPERSONATION=true
 # Optional: Choose which JWT field to use (default: username)
 export TRINO_IMPERSONATION_FIELD=email  # Options: username, email, subject
 ```
+
+> **Not needed with passthrough mode**: `TRINO_ENABLE_IMPERSONATION=true` is
+> mutually exclusive with `TRINO_AUTH_MODE=passthrough` (the server refuses
+> to start with both). In passthrough mode, queries already run as the real
+> user because their own credentials open the Trino connection — see
+> [passthrough.md](passthrough.md). Note that impersonation via
+> `X-Trino-User` is designed for Trino setups that trust the gateway
+> (no password auth, or certificate auth); an LDAP-configured Trino will
+> typically reject or override a session user that doesn't match the
+> authenticated principal.
 
 ### 2. Configure Trino Access Control
 

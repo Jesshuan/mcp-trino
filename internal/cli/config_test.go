@@ -240,12 +240,30 @@ func TestGetOutputFormat(t *testing.T) {
 	}
 }
 
-func TestApplyToEnv(t *testing.T) {
-	for _, v := range []string{"TRINO_HOST", "TRINO_PORT", "TRINO_USER", "TRINO_PASSWORD", "TRINO_CATALOG", "TRINO_SCHEMA", "TRINO_SSL", "TRINO_SOURCE"} {
-		_ = os.Unsetenv(v)
+// unsetTrinoEnv unsets the given variables for the duration of the test and
+// restores their previous values afterwards.
+func unsetTrinoEnv(t *testing.T, keys ...string) {
+	t.Helper()
+	for _, k := range keys {
+		orig := os.Getenv(k)
+		_ = os.Unsetenv(k)
+		t.Cleanup(func() {
+			if orig != "" {
+				_ = os.Setenv(k, orig)
+			} else {
+				_ = os.Unsetenv(k)
+			}
+		})
 	}
+}
+
+func TestApplyToEnv(t *testing.T) {
+	unsetTrinoEnv(t, "TRINO_HOST", "TRINO_PORT", "TRINO_USER", "TRINO_PASSWORD",
+		"TRINO_CATALOG", "TRINO_SCHEMA", "TRINO_SCHEME", "TRINO_SSL", "TRINO_SOURCE",
+		"TRINO_QUERY_TIMEOUT", "TRINO_MAX_ROWS", "TRINO_ALLOW_WRITE_QUERIES")
 
 	sslEnabled := true
+	allowWrite := true
 	cfg := &CLIConfig{
 		Current: "test-profile",
 		Profiles: map[string]TrinoProfileConfig{
@@ -253,6 +271,8 @@ func TestApplyToEnv(t *testing.T) {
 				Host: "testhost", Port: 9000, User: "testuser",
 				Password: "testpass", Catalog: "test_catalog", Schema: "test_schema",
 				Source: "test_source", SSL: SSLConfig{Enabled: &sslEnabled},
+				Scheme: "https", QueryTimeoutSeconds: 60, MaxRows: 5000,
+				AllowWriteQueries: &allowWrite,
 			},
 		},
 	}
@@ -262,6 +282,8 @@ func TestApplyToEnv(t *testing.T) {
 	checks := map[string]string{
 		"TRINO_HOST": "testhost", "TRINO_PORT": "9000", "TRINO_USER": "testuser",
 		"TRINO_SOURCE": "test_source", "TRINO_SSL": "true",
+		"TRINO_SCHEME": "https", "TRINO_QUERY_TIMEOUT": "60",
+		"TRINO_MAX_ROWS": "5000", "TRINO_ALLOW_WRITE_QUERIES": "true",
 	}
 	for k, want := range checks {
 		if got := os.Getenv(k); got != want {
@@ -270,8 +292,67 @@ func TestApplyToEnv(t *testing.T) {
 	}
 }
 
+// TestApplyToEnv_EnvBeatsProfile verifies the aws-cli/kubectl convention:
+// already-exported environment variables win over profile values.
+func TestApplyToEnv_EnvBeatsProfile(t *testing.T) {
+	unsetTrinoEnv(t, "TRINO_PORT", "TRINO_SCHEME")
+	_ = os.Setenv("TRINO_PORT", "7777")
+	_ = os.Setenv("TRINO_SCHEME", "http")
+
+	cfg := &CLIConfig{
+		Current: "p",
+		Profiles: map[string]TrinoProfileConfig{
+			"p": {Host: "h", Port: 9000, Scheme: "https"},
+		},
+	}
+
+	_ = cfg.ApplyToEnv("p")
+
+	if got := os.Getenv("TRINO_PORT"); got != "7777" {
+		t.Errorf("expected exported TRINO_PORT to win, got '%s'", got)
+	}
+	if got := os.Getenv("TRINO_SCHEME"); got != "http" {
+		t.Errorf("expected exported TRINO_SCHEME to win, got '%s'", got)
+	}
+}
+
+// TestApplyToEnv_ProfileFillsGaps verifies the profile fills variables that
+// are not exported.
+func TestApplyToEnv_ProfileFillsGaps(t *testing.T) {
+	unsetTrinoEnv(t, "TRINO_PORT", "TRINO_SCHEME")
+
+	cfg := &CLIConfig{
+		Current: "p",
+		Profiles: map[string]TrinoProfileConfig{
+			"p": {Host: "h", Port: 9000, Scheme: "https"},
+		},
+	}
+
+	_ = cfg.ApplyToEnv("p")
+
+	if got := os.Getenv("TRINO_PORT"); got != "9000" {
+		t.Errorf("expected TRINO_PORT='9000', got '%s'", got)
+	}
+	if got := os.Getenv("TRINO_SCHEME"); got != "https" {
+		t.Errorf("expected TRINO_SCHEME='https', got '%s'", got)
+	}
+}
+
+func TestApplyToEnv_AllowWriteQueriesNil(t *testing.T) {
+	unsetTrinoEnv(t, "TRINO_ALLOW_WRITE_QUERIES")
+
+	cfg := &CLIConfig{
+		Current:  "p",
+		Profiles: map[string]TrinoProfileConfig{"p": {Host: "h"}},
+	}
+	_ = cfg.ApplyToEnv("p")
+	if v := os.Getenv("TRINO_ALLOW_WRITE_QUERIES"); v != "" {
+		t.Errorf("expected TRINO_ALLOW_WRITE_QUERIES untouched when nil, got '%s'", v)
+	}
+}
+
 func TestApplyToEnv_SSLDisabled(t *testing.T) {
-	_ = os.Unsetenv("TRINO_SSL")
+	unsetTrinoEnv(t, "TRINO_SSL", "TRINO_SSL_INSECURE")
 	sslEnabled := false
 	cfg := &CLIConfig{
 		Current:  "p",
@@ -284,7 +365,7 @@ func TestApplyToEnv_SSLDisabled(t *testing.T) {
 }
 
 func TestApplyToEnv_SSLNotSet(t *testing.T) {
-	_ = os.Unsetenv("TRINO_SSL")
+	unsetTrinoEnv(t, "TRINO_SSL")
 	cfg := &CLIConfig{
 		Current:  "p",
 		Profiles: map[string]TrinoProfileConfig{"p": {Host: "h", SSL: SSLConfig{Enabled: nil}}},
@@ -483,7 +564,9 @@ func TestValidate(t *testing.T) {
 	}{
 		{"missing host", TrinoProfileConfig{Port: 443, User: "u"}},
 		{"invalid port", TrinoProfileConfig{Host: "h", Port: 0, User: "u"}},
-		{"missing user", TrinoProfileConfig{Host: "h", Port: 443}},
+		{"invalid scheme", TrinoProfileConfig{Host: "h", Port: 443, User: "u", Scheme: "ftp"}},
+		{"negative query_timeout", TrinoProfileConfig{Host: "h", Port: 443, User: "u", QueryTimeoutSeconds: -1}},
+		{"negative max_rows", TrinoProfileConfig{Host: "h", Port: 443, User: "u", MaxRows: -1}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := &CLIConfig{Current: "t", Profiles: map[string]TrinoProfileConfig{"t": tc.p}}
@@ -491,6 +574,14 @@ func TestValidate(t *testing.T) {
 				t.Error("should fail")
 			}
 		})
+	}
+
+	// Valid optional fields
+	valid := &CLIConfig{Current: "p", Profiles: map[string]TrinoProfileConfig{"p": {
+		Host: "h", Port: 443, User: "u", Scheme: "https", QueryTimeoutSeconds: 30, MaxRows: 1000,
+	}}}
+	if err := valid.Validate(); err != nil {
+		t.Errorf("Validate() failed for valid optional fields: %v", err)
 	}
 }
 

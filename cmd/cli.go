@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -9,6 +10,8 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+
+	"golang.org/x/term"
 
 	"github.com/tuannvm/mcp-trino/internal/cli"
 	"github.com/tuannvm/mcp-trino/internal/config"
@@ -66,6 +69,7 @@ func runCLI(stdout, stderr io.Writer, rawArgs []string) error {
 	port := flagSet.Int("port", 0, "Trino port (default: 8080)")
 	user := flagSet.String("user", "", "Trino user")
 	password := flagSet.String("password", "", "Trino password")
+	accessToken := flagSet.String("access-token", "", "Bearer token (JWT) forwarded to Trino (passthrough mode)")
 	catalog := flagSet.String("catalog", "", "Default catalog")
 	schema := flagSet.String("schema", "", "Default schema")
 	interactive := flagSet.Bool("interactive", false, "Start interactive REPL mode")
@@ -132,6 +136,11 @@ func runCLI(stdout, stderr io.Writer, rawArgs []string) error {
 		}
 	}
 
+	// Validate the whole config (all profiles) before applying anything
+	if err := cliConfig.Validate(); err != nil {
+		return fmt.Errorf("invalid config: %w", err)
+	}
+
 	// Resolve profile
 	activeProfile := *profileName
 	if activeProfile == "" {
@@ -167,15 +176,34 @@ func runCLI(stdout, stderr io.Writer, rawArgs []string) error {
 	}
 	applyFlagToEnv("TRINO_USER", *user)
 	applyFlagToEnv("TRINO_PASSWORD", *password)
+	applyFlagToEnv("TRINO_ACCESS_TOKEN", *accessToken)
 	applyFlagToEnv("TRINO_CATALOG", *catalog)
 	applyFlagToEnv("TRINO_SCHEMA", *schema)
+
+	// Load Trino configuration first: the auth mode determines which
+	// credentials are required
+	trinoConfig, err := config.NewTrinoConfigWithVersion(Version)
+	if err != nil {
+		return fmt.Errorf("failed to load configuration: %w", err)
+	}
 
 	// Validate required fields
 	if os.Getenv("TRINO_HOST") == "" {
 		return fmt.Errorf("missing required configuration: host not set (provide via --host flag, profile, or TRINO_HOST env var)")
 	}
 	if os.Getenv("TRINO_USER") == "" {
-		return fmt.Errorf("missing required configuration: user not set (provide via --user flag, profile, or TRINO_USER env var)")
+		// Passthrough mode has no shared service account: credentials are
+		// per-invocation, so prompt for them instead of failing. A bearer
+		// token replaces Basic credentials entirely — the identity lives in
+		// the token, no user is needed.
+		hasToken := os.Getenv("TRINO_ACCESS_TOKEN") != ""
+		if trinoConfig.AuthMode == "passthrough" && !hasToken {
+			if err := promptPassthroughCredentials(stderr); err != nil {
+				return err
+			}
+		} else if trinoConfig.AuthMode != "passthrough" {
+			return fmt.Errorf("missing required configuration: user not set (provide via --user flag, profile, or TRINO_USER env var)")
+		}
 	}
 
 	// Determine and validate output format
@@ -191,10 +219,8 @@ func runCLI(stdout, stderr io.Writer, rawArgs []string) error {
 		outputFormat = "table"
 	}
 
-	// Initialize Trino
-	trinoConfig, err := config.NewTrinoConfigWithVersion(Version)
-	if err != nil {
-		return fmt.Errorf("failed to load configuration: %w", err)
+	if trinoConfig.AuthMode == "passthrough" {
+		_, _ = fmt.Fprintln(stderr, "Passthrough mode: credentials from this invocation are forwarded to Trino")
 	}
 
 	trinoClient, err := trino.NewClient(trinoConfig)
@@ -212,6 +238,17 @@ func runCLI(stdout, stderr io.Writer, rawArgs []string) error {
 	// Set up context with signal handling
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	// Passthrough mode: this invocation's credentials are the query identity.
+	// The MCP server extracts HTTP Basic or Bearer credentials from requests;
+	// the CLI supplies them from the flags/env/prompt used to run the command.
+	if trinoConfig.AuthMode == "passthrough" {
+		if token := os.Getenv("TRINO_ACCESS_TOKEN"); token != "" {
+			ctx = trino.WithAccessToken(ctx, token)
+		} else {
+			ctx = trino.WithBasicCredentials(ctx, os.Getenv("TRINO_USER"), os.Getenv("TRINO_PASSWORD"))
+		}
+	}
 
 	// Handle interactive mode
 	if *interactive || (len(args) > 0 && args[0] == "interactive") {
@@ -365,6 +402,7 @@ FLAGS
     --port <port>       Trino port (default: 8080)
     --user <user>       Trino user (overrides profile and env)
     --password <pass>   Trino password
+    --access-token <jwt>  Bearer token forwarded to Trino (passthrough mode)
     --catalog <name>    Default catalog
     --schema <name>     Default schema
     --interactive       Start interactive REPL mode
@@ -394,31 +432,45 @@ EXAMPLES
     mcp-trino config profile list
     mcp-trino config profile use prod
 
+    # Passthrough mode: prompt for per-invocation credentials
+    TRINO_AUTH_MODE=passthrough mcp-trino --profile ldap-dev query 'SELECT 1'
+
+    # Passthrough mode with a bearer token (JWT) instead of user/password
+    TRINO_AUTH_MODE=passthrough mcp-trino --access-token "$TOKEN" query 'SELECT 1'
+
 ENVIRONMENT
     TRINO_HOST              Trino server hostname
     TRINO_PORT              Trino server port (default: 8080)
-    TRINO_USER              Trino username
+    TRINO_USER              Trino username (not required in passthrough mode)
     TRINO_PASSWORD          Trino password
+    TRINO_ACCESS_TOKEN      Bearer token (JWT) forwarded to Trino (passthrough mode)
     TRINO_CATALOG           Default catalog
     TRINO_SCHEMA            Default schema
+    TRINO_SCHEME            Connection scheme: http or https (default: https)
     TRINO_PROFILE           Profile name (same as --profile flag)
     TRINO_SSL               Enable SSL (true/false)
     TRINO_SSL_INSECURE      Skip SSL certificate verification (true/false)
     TRINO_ALLOW_WRITE_QUERIES  Allow write queries (default: false)
-    TRINO_QUERY_TIMEOUT     Query timeout in seconds (default: 30)
+    TRINO_QUERY_TIMEOUT     Query timeout in seconds (default: 300)
+    TRINO_MAX_ROWS          Max rows per query (default: 10000)
+    TRINO_SOURCE            Query source attribution (default: mcp-trino/<version>)
+    TRINO_AUTH_MODE         standard (service account) or passthrough (per-invocation credentials)
     NO_COLOR                Disable colored output when set
 
 CONFIGURATION
-    Config file: ~/.config/trino/config.json
+    Config file: ~/.config/trino/config.json (YAML config.yaml also supported)
 
-    Precedence (highest to lowest):
+    Value precedence (highest to lowest):
       1. CLI flags (--host, --user, etc.)
-      2. Profile from config file (--profile > TRINO_PROFILE > current)
-      3. Environment variables (TRINO_HOST, etc.)
-      4. Config file defaults
+      2. Exported environment variables (TRINO_HOST, etc.)
+      3. Active profile values (host, port, user, scheme, ssl, ...)
+      4. Built-in defaults
 
-    Note: Configuration uses JSON format. If migrating from an older YAML
-    config, convert ~/.config/trino/config.yaml to config.json manually.
+    Profile selection: --profile flag > TRINO_PROFILE > current > default
+
+    Note: an exported environment variable always wins over the profile
+    value (aws-cli/kubectl convention). Unset stale exports (e.g. an old
+    TRINO_PORT in .bashrc) if a profile value seems ignored.
 
 SEE ALSO
     Use '<command> --help' for more information about a specific command.
@@ -580,6 +632,43 @@ EXAMPLES
 	}
 }
 
+// promptPassthroughCredentials asks for per-invocation Trino credentials
+// (TRINO_AUTH_MODE=passthrough). The username is read normally and the
+// password without echo; only missing values are prompted. In passthrough
+// mode the CLI has no service account, so the credentials from this
+// invocation are forwarded to Trino as the query identity.
+func promptPassthroughCredentials(stderr io.Writer) error {
+	// Real terminal detection (not ModeCharDevice): /dev/null and pipes must
+	// not trigger an interactive prompt that would block forever
+	if !term.IsTerminal(int(syscall.Stdin)) {
+		return fmt.Errorf("TRINO_AUTH_MODE=passthrough requires per-invocation credentials: " +
+			"pass --user/--password or set TRINO_USER/TRINO_PASSWORD (no interactive terminal available)")
+	}
+
+	if os.Getenv("TRINO_USER") == "" {
+		_, _ = fmt.Fprint(stderr, "Trino user: ")
+		reader := bufio.NewReader(os.Stdin)
+		line, _ := reader.ReadString('\n')
+		user := strings.TrimSpace(line)
+		if user == "" {
+			return fmt.Errorf("no user provided")
+		}
+		_ = os.Setenv("TRINO_USER", user)
+	}
+
+	if os.Getenv("TRINO_PASSWORD") == "" {
+		_, _ = fmt.Fprint(stderr, "Trino password: ")
+		password, err := term.ReadPassword(int(syscall.Stdin))
+		if err != nil {
+			return fmt.Errorf("failed to read password: %w", err)
+		}
+		_, _ = fmt.Fprintln(stderr)
+		_ = os.Setenv("TRINO_PASSWORD", string(password))
+	}
+
+	return nil
+}
+
 // runConfigCommand handles config profile management commands
 func runConfigCommand(w io.Writer, args []string, cliConfig *cli.CLIConfig) error {
 	if len(args) < 2 {
@@ -681,6 +770,18 @@ func runProfileShow(w io.Writer, cliConfig *cli.CLIConfig, name string) error {
 	}
 	if profile.SSL.Insecure {
 		_, _ = fmt.Fprintln(w, "  SSL Insecure: true")
+	}
+	if profile.Scheme != "" {
+		_, _ = fmt.Fprintf(w, "  Scheme: %s\n", profile.Scheme)
+	}
+	if profile.QueryTimeoutSeconds > 0 {
+		_, _ = fmt.Fprintf(w, "  Query Timeout: %ds\n", profile.QueryTimeoutSeconds)
+	}
+	if profile.MaxRows > 0 {
+		_, _ = fmt.Fprintf(w, "  Max Rows: %d\n", profile.MaxRows)
+	}
+	if profile.AllowWriteQueries != nil {
+		_, _ = fmt.Fprintf(w, "  Allow Write Queries: %v\n", *profile.AllowWriteQueries)
 	}
 	return nil
 }

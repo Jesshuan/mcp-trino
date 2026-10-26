@@ -2,13 +2,18 @@ package trino
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
 	"database/sql"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/trinodb/trino-go-client/trino"
@@ -43,7 +48,7 @@ var (
 	}
 
 	// Pre-compiled write operation patterns
-	writeOpPatterns     []*regexp.Regexp
+	writeOpPatterns      []*regexp.Regexp
 	writeOpsExceptCreate []*regexp.Regexp
 
 	// Pre-compiled sanitization patterns
@@ -81,7 +86,79 @@ type contextKey string
 
 const (
 	impersonatedUserKey contextKey = "impersonated_user"
+	basicCredentialsKey contextKey = "basic_credentials"
+	accessTokenKey      contextKey = "access_token"
 )
+
+// basicCredentials holds per-user credentials extracted from an HTTP Basic
+// Authorization header (TRINO_AUTH_MODE=passthrough). They are used to open
+// a per-user Trino connection and must never be logged.
+type basicCredentials struct {
+	user     string
+	password string
+}
+
+// WithBasicCredentials attaches per-user credentials to the context
+// (TRINO_AUTH_MODE=passthrough)
+func WithBasicCredentials(ctx context.Context, user, password string) context.Context {
+	return context.WithValue(ctx, basicCredentialsKey, basicCredentials{user: user, password: password})
+}
+
+// GetBasicCredentials retrieves per-user credentials from the context
+func GetBasicCredentials(ctx context.Context) (user, password string, ok bool) {
+	creds, exists := ctx.Value(basicCredentialsKey).(basicCredentials)
+	if !exists || creds.user == "" {
+		return "", "", false
+	}
+	return creds.user, creds.password, true
+}
+
+// WithAccessToken attaches an ephemeral bearer token (JWT) to the context
+// (TRINO_AUTH_MODE=passthrough). The token is forwarded to Trino as
+// `Authorization: Bearer` — mcp-trino never validates it; Trino's JWT/OIDC
+// authenticator does. The client owns the token lifecycle: a refreshed token
+// simply arrives on the next request.
+func WithAccessToken(ctx context.Context, token string) context.Context {
+	return context.WithValue(ctx, accessTokenKey, token)
+}
+
+// GetAccessToken retrieves the bearer token from the context
+func GetAccessToken(ctx context.Context) (string, bool) {
+	token, exists := ctx.Value(accessTokenKey).(string)
+	if !exists || token == "" {
+		return "", false
+	}
+	return token, true
+}
+
+// jwtSubject extracts the `sub` claim from a JWT without verifying it. The
+// result is used only for connection-pool keying and query attribution — never
+// for authorization (Trino validates the token). Returns "" for malformed
+// tokens or payloads without a `sub` claim.
+func jwtSubject(token string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		Sub string `json:"sub"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return ""
+	}
+	return claims.Sub
+}
+
+// tokenHash returns a hex-encoded SHA-256 of a bearer token, used as a pool
+// key fallback when the token has no readable subject claim.
+func tokenHash(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return fmt.Sprintf("%x", sum)
+}
 
 // headerRoundTripper adds X-Trino-Source and X-Trino-User headers to requests
 type headerRoundTripper struct {
@@ -112,29 +189,89 @@ type Client struct {
 	db      *sql.DB
 	config  *config.TrinoConfig
 	timeout time.Duration
+
+	// Per-user connection cache for passthrough mode (TRINO_AUTH_MODE=passthrough)
+	userConns   map[string]*userConn
+	userConnsMu sync.Mutex
+	stopJanitor chan struct{}
 }
 
-// NewClient creates a new Trino client
-func NewClient(cfg *config.TrinoConfig) (*Client, error) {
-	dsnURL := url.URL{
-		Scheme: cfg.Scheme,
-		User:   url.UserPassword(cfg.User, cfg.Password),
-		Host:   fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
-	}
+// userConn is a cached per-user connection pool
+type userConn struct {
+	db       *sql.DB
+	password string    // Basic credentials: to detect credential rotation for the same username
+	token    string    // Bearer credentials: to detect token rotation for the same subject
+	lastUsed time.Time // guarded by Client.userConnsMu
+}
 
+// Limits for the per-user connection cache
+const (
+	maxUserConns        = 20               // max cached per-user pools (LRU eviction beyond this)
+	userConnIdleEvict   = 15 * time.Minute // evict pools unused for this long
+	userConnJanitorTick = 5 * time.Minute  // idle-sweep interval
+)
+
+// baseDSNParams assembles the connection parameters shared by every DSN
+// variant (service account, per-user Basic, per-token Bearer).
+func baseDSNParams(cfg *config.TrinoConfig) url.Values {
 	params := url.Values{}
 	params.Add("catalog", cfg.Catalog)
 	params.Add("schema", cfg.Schema)
 	params.Add("SSL", fmt.Sprintf("%t", cfg.SSL))
 	params.Add("SSLInsecure", fmt.Sprintf("%t", cfg.SSLInsecure))
 	params.Add("custom_client", "mcp-trino")
+	return params
+}
 
+// buildDSN constructs a Trino connection string for the given credentials
+func buildDSN(cfg *config.TrinoConfig, user, password string) string {
+	dsnURL := url.URL{
+		Scheme: cfg.Scheme,
+		User:   url.UserPassword(user, password),
+		Host:   fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
+	}
+
+	dsnURL.RawQuery = baseDSNParams(cfg).Encode()
+	return dsnURL.String()
+}
+
+// buildDSNToken constructs a Trino connection string that authenticates with
+// a bearer token (JWT) instead of user/password. No user info is embedded:
+// the trino-go-client sends `Authorization: Bearer <token>` (from the
+// accessToken DSN parameter) and no X-Trino-User header, so Trino derives the
+// identity from the token's claims via its JWT/OIDC authenticator.
+func buildDSNToken(cfg *config.TrinoConfig, token string) string {
+	dsnURL := url.URL{
+		Scheme: cfg.Scheme,
+		Host:   fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
+	}
+
+	params := baseDSNParams(cfg)
+	params.Add("accessToken", token)
 	dsnURL.RawQuery = params.Encode()
-	dsn := dsnURL.String()
+	return dsnURL.String()
+}
+
+// newTransport builds the base HTTP transport. When TRINO_SSL_INSECURE=true,
+// TLS certificate verification is skipped. The trino-go-client has no
+// "SSLInsecure" DSN parameter (it only supports SSLCert/SSLCertPath), so the
+// skip must be applied on this custom client's transport — otherwise the flag
+// is silently ignored and self-signed certificates fail verification.
+func newTransport(cfg *config.TrinoConfig) http.RoundTripper {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if cfg.SSLInsecure {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // #nosec G402 -- opt-in via TRINO_SSL_INSECURE
+	}
+	return transport
+}
+
+// NewClient creates a new Trino client
+func NewClient(cfg *config.TrinoConfig) (*Client, error) {
+	dsn := buildDSN(cfg, cfg.User, cfg.Password)
 
 	httpClient := &http.Client{
 		Transport: &headerRoundTripper{
-			base:   http.DefaultTransport,
+			base:   newTransport(cfg),
 			config: cfg,
 		},
 	}
@@ -157,8 +294,12 @@ func NewClient(cfg *config.TrinoConfig) (*Client, error) {
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
 
-	// Test the connection
-	if err := db.Ping(); err != nil {
+	// Test the connection (service account). In passthrough mode without a
+	// service-account password, per-user connections carry authentication
+	// instead, so the anonymous startup ping is skipped.
+	if cfg.AuthMode == "passthrough" && cfg.Password == "" {
+		log.Println("INFO: Passthrough mode without service-account password: skipping startup connection test")
+	} else if err := db.Ping(); err != nil {
 		closeErr := db.Close()
 		if closeErr != nil {
 			log.Printf("Error closing DB connection: %v", closeErr)
@@ -168,16 +309,178 @@ func NewClient(cfg *config.TrinoConfig) (*Client, error) {
 		return nil, fmt.Errorf("failed to ping Trino: %w", sanitizedErr)
 	}
 
-	return &Client{
+	client := &Client{
 		db:      db,
 		config:  cfg,
 		timeout: cfg.QueryTimeout,
-	}, nil
+	}
+	if cfg.AuthMode == "passthrough" {
+		client.userConns = make(map[string]*userConn)
+		client.stopJanitor = make(chan struct{})
+		go client.janitor()
+	}
+	return client, nil
 }
 
-// Close closes the database connection
+// Close closes the database connection(s)
 func (c *Client) Close() error {
+	if c.stopJanitor != nil {
+		close(c.stopJanitor)
+	}
+	c.userConnsMu.Lock()
+	for _, uc := range c.userConns {
+		if err := uc.db.Close(); err != nil {
+			log.Printf("Error closing user connection: %v", err)
+		}
+	}
+	c.userConnsMu.Unlock()
+	if c.db == nil {
+		return nil
+	}
 	return c.db.Close()
+}
+
+// dbForContext returns the connection pool to use for this request: the
+// shared service-account pool in standard mode, or a cached per-user pool
+// built from the request's Basic credentials or bearer token in passthrough
+// mode.
+func (c *Client) dbForContext(ctx context.Context) (*sql.DB, error) {
+	if c.config.AuthMode != "passthrough" {
+		return c.db, nil
+	}
+
+	if token, ok := GetAccessToken(ctx); ok {
+		return c.dbForToken(token)
+	}
+
+	user, password, ok := GetBasicCredentials(ctx)
+	if !ok {
+		return nil, fmt.Errorf("authentication required: passthrough mode requires HTTP Basic or Bearer credentials")
+	}
+
+	c.userConnsMu.Lock()
+	defer c.userConnsMu.Unlock()
+
+	if c.userConns == nil {
+		c.userConns = make(map[string]*userConn)
+	}
+
+	if uc, exists := c.userConns[user]; exists {
+		if uc.password == password {
+			uc.lastUsed = time.Now()
+			return uc.db, nil
+		}
+		// Credential changed for this username: drop the stale pool
+		_ = uc.db.Close()
+		delete(c.userConns, user)
+	}
+
+	c.evictLRUUserPool()
+	db, err := openPerUserPool(buildDSN(c.config, user, password))
+	if err != nil {
+		// Sanitize error to prevent password exposure
+		return nil, fmt.Errorf("failed to open Trino connection: %w", sanitizeConnectionError(err, password))
+	}
+
+	c.userConns[user] = &userConn{db: db, password: password, lastUsed: time.Now()}
+	return db, nil
+}
+
+// dbForToken returns the cached pool for a bearer token, opening a new one
+// when the token is unseen. Pools are keyed by the token's unverified `sub`
+// claim (identity for attribution and rotation detection only — Trino does
+// the real validation), falling back to the token hash when there is no
+// readable subject. A refreshed token for the same subject rotates the pool
+// exactly like a changed password does for Basic credentials.
+func (c *Client) dbForToken(token string) (*sql.DB, error) {
+	key := jwtSubject(token)
+	if key == "" {
+		key = "jwt-hash:" + tokenHash(token)
+	} else {
+		key = "jwt:" + key
+	}
+
+	c.userConnsMu.Lock()
+	defer c.userConnsMu.Unlock()
+
+	if c.userConns == nil {
+		c.userConns = make(map[string]*userConn)
+	}
+
+	if uc, exists := c.userConns[key]; exists {
+		if uc.token == token {
+			uc.lastUsed = time.Now()
+			return uc.db, nil
+		}
+		// Token rotated (refreshed or expired): drop the stale pool
+		_ = uc.db.Close()
+		delete(c.userConns, key)
+	}
+
+	c.evictLRUUserPool()
+	db, err := openPerUserPool(buildDSNToken(c.config, token))
+	if err != nil {
+		// Sanitize error to prevent token exposure
+		return nil, fmt.Errorf("failed to open Trino connection: %w", sanitizeConnectionError(err, token))
+	}
+
+	c.userConns[key] = &userConn{db: db, token: token, lastUsed: time.Now()}
+	return db, nil
+}
+
+// evictLRUUserPool closes and removes the least recently used cached pool
+// once the cache exceeds its cap. Callers must hold c.userConnsMu.
+func (c *Client) evictLRUUserPool() {
+	if len(c.userConns) < maxUserConns {
+		return
+	}
+	oldestKey := ""
+	var oldest time.Time
+	first := true
+	for k, uc := range c.userConns {
+		if first || uc.lastUsed.Before(oldest) {
+			oldestKey, oldest, first = k, uc.lastUsed, false
+		}
+	}
+	if oldestKey != "" {
+		_ = c.userConns[oldestKey].db.Close()
+		delete(c.userConns, oldestKey)
+	}
+}
+
+// openPerUserPool opens a small connection pool sized for a single user.
+// sql.Open is lazy — no connection is dialed here.
+func openPerUserPool(dsn string) (*sql.DB, error) {
+	db, err := sql.Open("trino", dsn)
+	if err != nil {
+		return nil, err
+	}
+	// Per-user pools are smaller than the service-account pool
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	return db, nil
+}
+
+// janitor periodically closes idle per-user connection pools
+func (c *Client) janitor() {
+	ticker := time.NewTicker(userConnJanitorTick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.stopJanitor:
+			return
+		case <-ticker.C:
+			c.userConnsMu.Lock()
+			for k, uc := range c.userConns {
+				if time.Since(uc.lastUsed) > userConnIdleEvict {
+					_ = uc.db.Close()
+					delete(c.userConns, k)
+				}
+			}
+			c.userConnsMu.Unlock()
+		}
+	}
 }
 
 // WithImpersonatedUser adds impersonated user to context
@@ -336,10 +639,26 @@ func (c *Client) ExecuteQueryWithContext(ctx context.Context, query string) (*Qu
 	queryCtx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
+	// Select the connection pool: shared service account, or per-user
+	// credentials from the request context (passthrough mode)
+	db, err := c.dbForContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	// Build query arguments for per-query user identity and attribution
 	// These are passed as NamedArgs to the Trino driver, which uses them to set
 	// session properties regardless of the authentication method.
 	_, userName := getOAuthUserAndUsername(ctx)
+	// In passthrough mode, attribute queries to the authenticated user:
+	// the Basic username, or the bearer token's unverified `sub` claim
+	if user, _, ok := GetBasicCredentials(ctx); ok {
+		userName = user
+	} else if token, ok := GetAccessToken(ctx); ok {
+		if sub := jwtSubject(token); sub != "" {
+			userName = sub
+		}
+	}
 	queryArgs := []interface{}{
 		sql.Named("X-Trino-Client-Tags", userName),
 		sql.Named("X-Trino-Client-Info", userName),
@@ -359,7 +678,7 @@ func (c *Client) ExecuteQueryWithContext(ctx context.Context, query string) (*Qu
 	}
 
 	// Execute the query with optional attribution headers
-	rows, err := c.db.QueryContext(queryCtx, query, queryArgs...)
+	rows, err := db.QueryContext(queryCtx, query, queryArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("query execution failed: %w", err)
 	}
